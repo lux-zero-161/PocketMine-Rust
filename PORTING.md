@@ -44,6 +44,7 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | `LevelChunk`-Streaming mit Paletten-Subchunks | ✅ | eigener Encoder, Chunk-Burst |
 | NBT-Writer/Reader (Bedrock-Netzwerkformat) | ✅ | `pm_nbt`, Palette + Chunkdaten |
 | UDP-Integrationstest Login → StartGame → Chunk | ✅ | echter Socket, Split-Reassembly |
+| Spawn-Sequenz (`AvailableCommands`, `UpdateAbilities`, `MovePlayer`, `PLAYER_SPAWN`) | ✅ | Client kann Loading-Screen verlassen |
 | Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 

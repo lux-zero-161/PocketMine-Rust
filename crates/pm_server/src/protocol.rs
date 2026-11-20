@@ -18,6 +18,15 @@ pub const BIOME_DEFINITION_LIST_PACKET: u32 = 0x7a;
 pub const ITEM_REGISTRY_PACKET: u32 = 0xa2;
 pub const JIGSAW_STRUCTURE_DATA_PACKET: u32 = 0x139;
 pub const VOXEL_SHAPES_PACKET: u32 = 0x151;
+pub const PLAY_STATUS_PACKET: u32 = 0x02;
+pub const MOVE_PLAYER_PACKET: u32 = 0x13;
+pub const SET_SPAWN_POSITION_PACKET: u32 = 0x2b;
+pub const SET_DIFFICULTY_PACKET: u32 = 0x3c;
+pub const AVAILABLE_COMMANDS_PACKET: u32 = 0x4c;
+pub const SET_TIME_PACKET: u32 = 0x0a;
+pub const UPDATE_ABILITIES_PACKET: u32 = 0xbb;
+
+pub const PLAY_STATUS_PLAYER_SPAWN: i32 = 3;
 
 pub const BLOCK_STATE_VERSION: i32 = 18168865;
 
@@ -455,7 +464,125 @@ pub fn pre_spawn_packets(
         item_registry_packet(),
         available_actor_identifiers_packet(),
         biome_definition_list_packet(),
+        available_commands_packet(),
+        update_abilities_packet(player),
+        set_difficulty_packet(world.difficulty as u32),
+        set_spawn_position_packet(world.spawn_position().floor()),
+        set_time_packet(world.time()),
     ]
+}
+
+/// Packets sent after the initial chunks so the client can leave the loading
+/// screen.
+pub fn spawn_packets(player: &Player, world: &World, tick: u64) -> Vec<Vec<u8>> {
+    vec![
+        move_player_packet(player, tick),
+        play_status_packet(PLAY_STATUS_PLAYER_SPAWN),
+        set_time_packet(world.time()),
+    ]
+}
+
+pub fn play_status_packet(status: i32) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4);
+    body.extend_from_slice(&status.to_be_bytes());
+    packet(PLAY_STATUS_PACKET, body)
+}
+
+pub fn set_time_packet(time: i64) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_varint_signed(&mut body, time as i32);
+    packet(SET_TIME_PACKET, body)
+}
+
+pub fn set_difficulty_packet(difficulty: u32) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_varint(&mut body, difficulty);
+    packet(SET_DIFFICULTY_PACKET, body)
+}
+
+pub fn set_spawn_position_packet(spawn: BlockPosition) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_varint_signed(&mut body, 0); // player spawn
+    put_block_position(&mut body, spawn);
+    write_varint_signed(&mut body, 0); // dimension
+    put_block_position(&mut body, spawn);
+    packet(SET_SPAWN_POSITION_PACKET, body)
+}
+
+pub fn move_player_packet(player: &Player, tick: u64) -> Vec<u8> {
+    let position = player.position();
+    let yaw = *player.yaw.read().unwrap() as f32;
+    let mut body = Vec::with_capacity(48);
+    put_varlong_unsigned(&mut body, player.entity_id);
+    body.extend_from_slice(&(position.x as f32).to_le_bytes());
+    body.extend_from_slice(&(position.y as f32).to_le_bytes());
+    body.extend_from_slice(&(position.z as f32).to_le_bytes());
+    body.extend_from_slice(&(*player.pitch.read().unwrap() as f32).to_le_bytes());
+    body.extend_from_slice(&yaw.to_le_bytes());
+    body.extend_from_slice(&yaw.to_le_bytes()); // head yaw
+    body.push(2); // teleport
+    put_bool(&mut body, true); // on ground
+    put_varlong_unsigned(&mut body, 0); // riding actor
+    put_bool(&mut body, false); // no teleport telemetry
+    put_varlong_unsigned(&mut body, tick);
+    packet(MOVE_PLAYER_PACKET, body)
+}
+
+pub fn available_commands_packet() -> Vec<u8> {
+    let mut body = Vec::new();
+    for _ in 0..8 {
+        write_varint(&mut body, 0);
+    }
+    packet(AVAILABLE_COMMANDS_PACKET, body)
+}
+
+pub fn update_abilities_packet(player: &Player) -> Vec<u8> {
+    const BUILD: u32 = 1 << 0;
+    const MINE: u32 = 1 << 1;
+    const DOORS: u32 = 1 << 2;
+    const CONTAINERS: u32 = 1 << 3;
+    const ATTACK_PLAYERS: u32 = 1 << 4;
+    const ATTACK_MOBS: u32 = 1 << 5;
+    const FLYING: u32 = 1 << 9;
+    const ALLOW_FLIGHT: u32 = 1 << 10;
+    const INFINITE_RESOURCES: u32 = 1 << 11;
+    const FLY_SPEED: u32 = 1 << 13;
+    const WALK_SPEED: u32 = 1 << 14;
+    const VERTICAL_FLY_SPEED: u32 = 1 << 19;
+
+    let creative = matches!(
+        player.gamemode(),
+        pm_player::GameMode::Creative | pm_player::GameMode::Spectator
+    );
+    let mut set = BUILD
+        | MINE
+        | DOORS
+        | CONTAINERS
+        | ATTACK_PLAYERS
+        | ATTACK_MOBS
+        | FLYING
+        | ALLOW_FLIGHT
+        | FLY_SPEED
+        | WALK_SPEED
+        | VERTICAL_FLY_SPEED;
+    let mut values = BUILD | MINE | DOORS | CONTAINERS | ATTACK_PLAYERS | ATTACK_MOBS;
+    if creative {
+        values |= FLYING | ALLOW_FLIGHT | INFINITE_RESOURCES;
+        set |= INFINITE_RESOURCES;
+    }
+
+    let mut body = Vec::with_capacity(64);
+    body.extend_from_slice(&(player.entity_id as i64).to_le_bytes());
+    body.push(if player.is_op() { 2 } else { 1 }); // player permission
+    body.push(0); // command permission: normal
+    body.push(1); // one ability layer
+    body.extend_from_slice(&1u16.to_le_bytes()); // base layer
+    body.extend_from_slice(&set.to_le_bytes());
+    body.extend_from_slice(&values.to_le_bytes());
+    body.extend_from_slice(&0.05f32.to_le_bytes()); // fly speed
+    body.extend_from_slice(&0.05f32.to_le_bytes()); // vertical fly speed
+    body.extend_from_slice(&0.1f32.to_le_bytes()); // walk speed
+    packet(UPDATE_ABILITIES_PACKET, body)
 }
 
 /// Convenience for the initial view-distance chunk burst.

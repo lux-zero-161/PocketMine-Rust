@@ -48,7 +48,8 @@ Verified by `./tools/smoke-test.sh`:
 | Logged-in clients become real players (join/quit events) | ✅ |
 | `StartGame` (level settings, block palette, full item registry) | ✅ experimental |
 | `LevelChunk` streaming with palette-packed sub-chunks | ✅ experimental |
-| Jigsaw/VoxelShapes/BiomeDefs supporting packets | ✅ minimal |
+| Jigsaw/VoxelShapes/BiomeDefs/Commands/Abilities packets | ✅ |
+| Spawn sequence: `MovePlayer`, `SetSpawnPosition`, `PLAYER_SPAWN` | ✅ |
 | Real vanilla-client verification, entities | ⏳ next |
 | Network NBT writer/reader (`pm_nbt`) | ✅ |
 
@@ -70,7 +71,7 @@ gameplay and protocol coverage.
 | Commands | 35 % | map, aliases, permissions, 19 built-ins |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 65 % | encrypted login, resource packs, StartGame, chunk streaming |
+| Network (RakNet/Bedrock) | 70 % | login, resource packs, StartGame, chunks, spawn sequence |
 | World (chunks, sections, block API) | 45 % | network chunk encoder added, still no LevelDB |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |

@@ -351,6 +351,13 @@ impl ServerState {
             palette.len()
         ));
         self.send_chunks_for(address, 2);
+        if let Some(network) = self.network.lock().unwrap().clone() {
+            network.send_packets(
+                address,
+                crate::protocol::spawn_packets(&player, &world, self.tick_now()),
+                None,
+            );
+        }
     }
 
     /// Sends `LevelChunk` packets around the player's current position.
