@@ -36,7 +36,10 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | ECDH P-384 + ES384 Handshake-JWT | ✅ | `ServerToClientHandshake`, Signatur verifiziert |
 | AES-256-CFB8 + PMMP-Checksummen | ✅ | Roundtrip- und Tamper-Tests |
 | Verschlüsselter `ClientToServerHandshake` → `LoginSuccess` | ✅ | Ende-zu-Ende-Test inkl. Entschlüsselung |
-| `StartGame`, Block-/Item-Paletten, Chunk-Streaming | ⏳ | Client wird nach Login sauber getrennt |
+| `ResourcePacksInfo` / `ResourcePackStack` + Client-Responses | ✅ | Status 2/3, Stack-Antwort |
+| `RequestChunkRadius` → `ChunkRadiusUpdated`, `SetTime` | ✅ | Radius wird begrenzt |
+| Login → echter Spieler + Join/Quit-Events | ✅ | `process_network_events`, Session-Timeout |
+| `StartGame`, Block-/Item-Paletten, Chunk-Streaming | ⏳ | Client wird nach dem Stack sauber getrennt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 
 ---
@@ -132,8 +135,10 @@ Rust nur liest.
 1. ✅ `Login`-Paket parsen, Offline-Identität, Client-Public-Key.
 2. ✅ `ServerToClientHandshake` (ECDH P-384, ES384), AES-256-CFB8, Checksummen.
 3. ✅ Compression (raw Deflate), Batches, Split-Frames.
-4. ⏳ `ResourcePacksInfo`, `StartGame`, `BiomeDefinitionList`, `AvailableCommands`.
-5. ⏳ Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
+4. ✅ `ResourcePacksInfo`, `ResourcePackStack`, Client-Responses.
+5. ✅ `RequestChunkRadius`, `ChunkRadiusUpdated`, `SetTime`, Session-Timeout.
+6. ⏳ `StartGame`, `BiomeDefinitionList`, `AvailableCommands`, Item-Registry.
+7. ⏳ Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
    **Abnahme:** Vanilla-Client 1.26.60 joint, sieht flache Welt, kann laufen.
 
 ### M2 – Welt & Blöcke

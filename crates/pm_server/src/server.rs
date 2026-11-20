@@ -1,13 +1,14 @@
 use pm_command::{Command, ConsoleCommandSender, SimpleCommandMap};
 use pm_core::{text, Logger, ServerProperties, VersionInfo};
-use pm_event::Event;
+use pm_event::{Event, PlayerJoinEvent, PlayerQuitEvent};
 use pm_permission::PermissionRegistry;
 use pm_player::{Player, PlayerManager};
 use pm_plugin_host::{PluginHost, ServerBridge};
 use pm_scheduler::TaskScheduler;
 use pm_world::{Block, World, WorldManager};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
@@ -31,6 +32,8 @@ pub struct ServerState {
     pub plugin_host: OnceLock<Arc<PluginHost>>,
     pub network: Mutex<Option<Arc<pm_network::BedrockNetworkServer>>>,
     pub worlds_path: RwLock<String>,
+    /// Connected player name (lowercase) -> UDP session address.
+    pub player_sessions: RwLock<HashMap<String, SocketAddr>>,
 }
 
 impl ServerState {
@@ -53,6 +56,7 @@ impl ServerState {
             plugin_host: OnceLock::new(),
             network: Mutex::new(None),
             worlds_path: RwLock::new(pm_core::WORLD_DIRECTORY.to_string()),
+            player_sessions: RwLock::new(HashMap::new()),
         })
     }
 
@@ -203,6 +207,91 @@ impl ServerState {
                     self.logger
                         .info(&format!("[{}] {}", player.name, text::to_ansi(&message)));
                 }
+            }
+        }
+    }
+
+    /// Turns network login/disconnect events into real player sessions and
+    /// server events. Called once per tick after `network.process_packets()`.
+    pub fn process_network_events(&self) {
+        let network = { self.network.lock().unwrap().clone() };
+
+        if let Some(network) = network.as_ref() {
+            for login in network.take_logins() {
+                let name = if login.identity.display_name.trim().is_empty() {
+                    format!("Player{}", login.address.port())
+                } else {
+                    login.identity.display_name.clone()
+                };
+                let uuid = if login.identity.identity.trim().is_empty() {
+                    let mut hash: u64 = 0xcbf29ce484222325;
+                    for byte in name.as_bytes() {
+                        hash ^= *byte as u64;
+                        hash = hash.wrapping_mul(0x100000001b3);
+                    }
+                    format!("00000000-0000-0000-0000-{:012x}", hash & 0xffffffffffff)
+                } else {
+                    login.identity.identity.clone()
+                };
+
+                if let Some(existing) = self.players.get(&name) {
+                    existing.set_online(false);
+                    self.player_sessions.write().unwrap().remove(&name.to_ascii_lowercase());
+                }
+
+                let world = self.default_world();
+                let spawn = world
+                    .as_ref()
+                    .map(|world| world.spawn_position())
+                    .unwrap_or_else(|| pm_math::Vector3::new(0.0, 5.0, 0.0));
+                let mut player = Player::new(name.clone(), uuid.clone(), spawn, self.props.level_name.clone());
+                player.entity_id = self.tick_now() + 1;
+                player.address = login.address.ip().to_string();
+                player.port = login.address.port();
+                player.xuid = login.identity.xuid.clone();
+                let player = Arc::new(player);
+                self.players.add(player.clone());
+                self.player_sessions
+                    .write()
+                    .unwrap()
+                    .insert(name.to_ascii_lowercase(), login.address);
+
+                if let Some(world) = world.as_ref() {
+                    // Bounded preload; proper view-distance streaming comes with StartGame.
+                    world.load_chunks_around(spawn, self.props.view_distance.min(4) as i32);
+                }
+
+                let mut event = PlayerJoinEvent::new(player.name.clone(), player.uuid.clone(), String::new());
+                self.dispatch(&mut event);
+                let message = if event.join_message.is_empty() {
+                    format!("§e{} joined the game", player.name)
+                } else {
+                    event.join_message.clone()
+                };
+                self.broadcast(&message);
+                player.send_message(&format!("§aWelcome to {}!", self.props.motd));
+                self.logger.info(&format!(
+                    "Player {} connected from {} ({})",
+                    player.name, login.address, player.uuid
+                ));
+            }
+
+            for disconnect in network.take_disconnects() {
+                self.player_sessions
+                    .write()
+                    .unwrap()
+                    .remove(&disconnect.name.to_ascii_lowercase());
+                if let Some(player) = self.players.get(&disconnect.name) {
+                    let mut event = PlayerQuitEvent::new(player.name.clone(), player.uuid.clone(), String::new());
+                    self.dispatch(&mut event);
+                    let message = if event.quit_message.is_empty() {
+                        format!("§e{} left the game", player.name)
+                    } else {
+                        event.quit_message.clone()
+                    };
+                    self.broadcast(&message);
+                }
+                self.players.remove(&disconnect.name);
             }
         }
     }

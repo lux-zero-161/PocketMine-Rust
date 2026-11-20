@@ -42,6 +42,9 @@ Verified by `./tools/smoke-test.sh`:
 | Bedrock `NetworkSettings` + offline `Login` parsing | ✅ |
 | ECDH P-384 handshake JWT (ES384) + AES-256-CFB8 encryption | ✅ |
 | Encrypted `ClientToServerHandshake` → `LoginSuccess` | ✅ |
+| `ResourcePacksInfo` / `ResourcePackStack` + client responses | ✅ |
+| `RequestChunkRadius` → `ChunkRadiusUpdated`, `SetTime` | ✅ |
+| Logged-in clients become real players (join/quit events) | ✅ |
 | `StartGame`, chunk streaming, entities | ⏳ roadmap |
 
 ### Progress by subsystem
@@ -62,7 +65,7 @@ gameplay and protocol coverage.
 | Commands | 35 % | map, aliases, permissions, 19 built-ins |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 40 % | ping, batches, split frames, compression, encrypted login handshake |
+| Network (RakNet/Bedrock) | 45 % | ping, batches, split frames, compression, encrypted login, resource packs, chunk radius |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
@@ -70,8 +73,10 @@ gameplay and protocol coverage.
 
 ### Next milestones
 
-1. **M1 Login:** ~~JWT parsing, `ServerToClientHandshake`, AES, compression~~
-   – done. Next: `StartGame`, item/block palettes and chunk streaming.
+1. **M1 Login:** ~~JWT parsing, `ServerToClientHandshake`, AES, compression,
+   resource packs, chunk radius~~ – done. Next: `StartGame`, block/item
+   palettes and chunk streaming. Until then the server disconnects cleanly
+   after the resource pack stack.
 2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates.
 3. **M3 Gameplay:** entities, physics, damage/death, inventory transactions.
 4. **M4 API parity:** all PMMP events, form API, command parser, selectors.

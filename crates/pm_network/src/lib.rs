@@ -34,6 +34,8 @@ pub mod protocol {
     pub const SERVER_TO_CLIENT_HANDSHAKE: u8 = 0x03;
     pub const CLIENT_TO_SERVER_HANDSHAKE: u8 = 0x04;
     pub const DISCONNECT: u8 = 0x05;
+    pub const RESOURCE_PACKS_INFO: u8 = 0x06;
+    pub const RESOURCE_PACK_STACK: u8 = 0x07;
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u8 = 0x08;
     pub const TEXT: u8 = 0x09;
     pub const SET_TIME: u8 = 0x0a;
@@ -126,6 +128,15 @@ pub fn write_varint(out: &mut Vec<u8>, mut value: u32) {
         out.push(((value & 0x7f) | 0x80) as u8);
         value >>= 7;
     }
+}
+
+pub fn write_varint_signed(out: &mut Vec<u8>, value: i32) {
+    write_varint(out, ((value << 1) ^ (value >> 31)) as u32);
+}
+
+pub fn read_varint_signed(input: &[u8], offset: &mut usize) -> Option<i32> {
+    let value = read_varint(input, offset)?;
+    Some(((value >> 1) as i32) ^ -((value & 1) as i32))
 }
 
 pub fn read_varint(input: &[u8], offset: &mut usize) -> Option<u32> {
@@ -500,6 +511,7 @@ pub struct Session {
     pub compression_threshold: u16,
     pub compression_enabled: bool,
     pub encryption: Option<EncryptionContext>,
+    pub login: Option<LoginIdentity>,
     split_assemblies: HashMap<u16, SplitAssembly>,
 }
 
@@ -516,6 +528,7 @@ impl Session {
             compression_threshold: 256,
             compression_enabled: false,
             encryption: None,
+            login: None,
             split_assemblies: HashMap::new(),
         }
     }
@@ -537,6 +550,20 @@ pub struct LoginIdentity {
     pub xuid: String,
     /// Client ECDH public key (DER/SPKI), required for the handshake.
     pub client_public_key: Option<Vec<u8>>,
+}
+
+/// A client that completed the encrypted login handshake.
+#[derive(Debug, Clone)]
+pub struct PendingLogin {
+    pub address: SocketAddr,
+    pub identity: LoginIdentity,
+}
+
+/// A client that disconnected after logging in.
+#[derive(Debug, Clone)]
+pub struct PendingDisconnect {
+    pub address: SocketAddr,
+    pub name: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -567,6 +594,8 @@ pub struct BedrockNetworkServer {
     packet_handler: Arc<RwLock<Option<Box<dyn FnMut(SocketAddr, &[u8]) + Send + Sync>>>>,
     next_guid: AtomicU64,
     server_key: Arc<PKey<Private>>,
+    pending_logins: std::sync::Mutex<Vec<PendingLogin>>,
+    pending_disconnects: std::sync::Mutex<Vec<PendingDisconnect>>,
 }
 
 impl BedrockNetworkServer {
@@ -612,6 +641,8 @@ impl BedrockNetworkServer {
             packet_handler: Arc::new(RwLock::new(None)),
             next_guid: AtomicU64::new(guid as u64),
             server_key,
+            pending_logins: std::sync::Mutex::new(Vec::new()),
+            pending_disconnects: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -633,6 +664,18 @@ impl BedrockNetworkServer {
 
     pub fn session_count(&self) -> usize {
         self.sessions.read().unwrap().len()
+    }
+
+    /// Removes and returns clients that just completed the login handshake.
+    pub fn take_logins(&self) -> Vec<PendingLogin> {
+        let mut guard = self.pending_logins.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Removes and returns clients that disconnected.
+    pub fn take_disconnects(&self) -> Vec<PendingDisconnect> {
+        let mut guard = self.pending_disconnects.lock().unwrap();
+        std::mem::take(&mut *guard)
     }
 
     pub fn set_packet_handler<F>(&self, handler: F)
@@ -658,11 +701,33 @@ impl BedrockNetworkServer {
                 }
             }
         }
+        self.expire_sessions();
+    }
+
+    /// Drops sessions that have been silent for 30 seconds (client closed
+    /// without a Disconnect packet).
+    fn expire_sessions(&self) {
+        let now = now_millis();
+        let stale: Vec<SocketAddr> = self
+            .sessions
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, session)| now.saturating_sub(session.last_seen) > 30_000)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in stale {
+            self.logger.debug(&format!("Session {} timed out", addr));
+            self.disconnect(addr);
+        }
     }
 
     fn handle_datagram(&self, addr: SocketAddr, data: &[u8]) {
         if data.is_empty() {
             return;
+        }
+        if let Some(session) = self.sessions.write().unwrap().get_mut(&addr) {
+            session.last_seen = now_millis();
         }
         match data[0] {
             ID_UNCONNECTED_PING => self.handle_ping(addr, data),
@@ -907,9 +972,18 @@ impl BedrockNetworkServer {
                 self.stats.write().unwrap().encryptions += 1;
                 self.logger.info(&format!("Encryption handshake completed for {}", addr));
                 self.send_play_status(addr, PLAY_STATUS_LOGIN_SUCCESS);
-                // StartGame/chunk streaming is the next milestone. Disconnect
-                // with a readable reason instead of leaving the client hanging.
-                self.send_disconnect(addr, "PocketMine-Rust: encryption OK, world streaming is the next milestone");
+                self.send_resource_packs_info(addr);
+            }
+            RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, packet),
+            REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, packet),
+            DISCONNECT => {
+                if let Some((name, _message)) = parse_disconnect(packet) {
+                    self.logger.info(&format!("Client {} disconnected: {}", addr, name));
+                }
+                self.disconnect(addr);
+            }
+            SET_LOCAL_PLAYER_AS_INITIALIZED => {
+                self.logger.info(&format!("Client {} spawned (SetLocalPlayerAsInitialized)", addr));
             }
             _ => {
                 if let Some(handler) = self.packet_handler.write().unwrap().as_mut() {
@@ -953,6 +1027,70 @@ impl BedrockNetworkServer {
         self.send_packets(addr, vec![payload], None);
     }
 
+    fn send_resource_packs_info(&self, addr: SocketAddr) {
+        let mut payload = Vec::with_capacity(32);
+        payload.push(RESOURCE_PACKS_INFO);
+        payload.push(0); // must accept
+        payload.push(0); // has addons
+        payload.push(0); // has scripts
+        payload.push(0); // force disable vibrant visuals
+        payload.extend_from_slice(&[0u8; 16]); // world template id
+        write_varint(&mut payload, 0); // world template version
+        write_varint(&mut payload, 0); // resource pack entries
+        self.send_packets(addr, vec![payload], None);
+    }
+
+    fn send_resource_pack_stack(&self, addr: SocketAddr) {
+        let mut payload = Vec::new();
+        payload.push(RESOURCE_PACK_STACK);
+        payload.push(0); // must accept
+        write_varint(&mut payload, 0); // resource pack stack
+        write_varint(&mut payload, pm_core::MINECRAFT_VERSION_NETWORK.len() as u32);
+        payload.extend_from_slice(pm_core::MINECRAFT_VERSION_NETWORK.as_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes()); // experiments count
+        payload.push(0); // has previously used experiments
+        payload.push(0); // use vanilla editor packs
+        self.send_packets(addr, vec![payload], None);
+    }
+
+    fn handle_resource_pack_response(&self, addr: SocketAddr, packet: &[u8]) {
+        let mut offset = 1usize;
+        let status = read_varint(packet, &mut offset).unwrap_or(0);
+        let status_text = read_string(packet, &mut offset).unwrap_or_default();
+        self.logger.debug(&format!("Resource pack response from {}: {} ({})", addr, status, status_text));
+        match status {
+            2 => self.send_resource_pack_stack(addr),
+            3 => {
+                self.logger.info(&format!(
+                    "Client {} completed the resource pack stack; StartGame is the next milestone",
+                    addr
+                ));
+                self.send_disconnect(addr, "PocketMine-Rust: StartGame/chunk streaming is the next milestone");
+            }
+            0 => {
+                self.send_disconnect(addr, "Resource packs were refused");
+                self.disconnect(addr);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_request_chunk_radius(&self, addr: SocketAddr, packet: &[u8]) {
+        let mut offset = 1usize;
+        let requested = read_varint_signed(packet, &mut offset).unwrap_or(4);
+        let radius = requested.clamp(2, 32);
+        self.logger.debug(&format!("Chunk radius request from {}: {} -> {}", addr, requested, radius));
+        let mut payload = Vec::new();
+        payload.push(CHUNK_RADIUS_UPDATED);
+        write_varint_signed(&mut payload, radius);
+        self.send_packets(addr, vec![payload], None);
+
+        let mut time = Vec::new();
+        time.push(SET_TIME);
+        write_varint_signed(&mut time, 0);
+        self.send_packets(addr, vec![time], None);
+    }
+
     /// Performs the `ServerToClientHandshake` exchange. The handshake packet is
     /// sent compressed but still unencrypted; encryption starts right after.
     fn begin_login_encryption(&self, addr: SocketAddr, identity: &LoginIdentity) -> bool {
@@ -993,11 +1131,17 @@ impl BedrockNetworkServer {
                 return false;
             }
         };
-        let mut sessions = self.sessions.write().unwrap();
-        let Some(session) = sessions.get_mut(&addr) else { return false };
-        session.encryption = Some(context);
-        drop(sessions);
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            let Some(session) = sessions.get_mut(&addr) else { return false };
+            session.encryption = Some(context);
+            session.login = Some(identity.clone());
+        }
         self.logger.info(&format!("ServerToClientHandshake sent to {}; encryption enabled", addr));
+        self.pending_logins
+            .lock()
+            .unwrap()
+            .push(PendingLogin { address: addr, identity: identity.clone() });
         true
     }
 
@@ -1052,7 +1196,13 @@ impl BedrockNetworkServer {
     }
 
     pub fn disconnect(&self, addr: SocketAddr) {
-        self.sessions.write().unwrap().remove(&addr);
+        let login = self.sessions.write().unwrap().remove(&addr).and_then(|session| session.login);
+        if let Some(identity) = login {
+            self.pending_disconnects
+                .lock()
+                .unwrap()
+                .push(PendingDisconnect { address: addr, name: identity.display_name });
+        }
     }
 
     pub fn stop(&self) {
@@ -1070,6 +1220,29 @@ impl Drop for BedrockNetworkServer {
 // ---------------------------------------------------------------------------
 // Login parsing (offline mode)
 // ---------------------------------------------------------------------------
+
+fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
+    let length = read_varint(input, offset)? as usize;
+    if *offset + length > input.len() {
+        return None;
+    }
+    let text = std::str::from_utf8(&input[*offset..*offset + length]).ok()?.to_string();
+    *offset += length;
+    Some(text)
+}
+
+fn parse_disconnect(packet: &[u8]) -> Option<(String, String)> {
+    // reason varint, then type varint (0 = message), then message string
+    let mut offset = 1usize;
+    let _reason = read_varint_signed(packet, &mut offset)?;
+    let kind = read_varint(packet, &mut offset)?;
+    if kind != 0 {
+        return None;
+    }
+    let message = read_string(packet, &mut offset).unwrap_or_default();
+    let name = if message.is_empty() { "client".to_string() } else { message };
+    Some((name, String::new()))
+}
 
 fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
@@ -1528,21 +1701,64 @@ mod tests {
         send_frames(&client, &server, &encrypted, 3);
         assert_eq!(server.stats().encryptions, 1);
 
-        // PlayStatus(LoginSuccess) and Disconnect arrive as two encrypted batches.
-        let mut packets = Vec::new();
-        for _ in 0..2 {
+        let recv_decrypted = |crypto: &mut EncryptionContext| -> Vec<Vec<u8>> {
             let encrypted = recv_game_payload(&client);
-            let decrypted = client_crypto.decrypt(&encrypted).expect("server packet decrypt");
+            let decrypted = crypto.decrypt(&encrypted).expect("server packet decrypt");
             let batch = decompress_batch(&decrypted).expect("server packet decompress");
-            packets.extend(decode_batch(&batch).unwrap());
-        }
+            decode_batch(&batch).unwrap()
+        };
+
+        // PlayStatus(LoginSuccess) and ResourcePacksInfo.
+        let packets = recv_decrypted(&mut client_crypto);
         assert_eq!(packets[0][0], PLAY_STATUS);
         assert_eq!(
             i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
             PLAY_STATUS_LOGIN_SUCCESS
         );
-        assert_eq!(packets[1][0], DISCONNECT);
+        let packs = recv_decrypted(&mut client_crypto);
+        assert_eq!(packs[0][0], RESOURCE_PACKS_INFO);
+
+        let logins = server.take_logins();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].identity.display_name, "Steve");
         assert_eq!(server.stats().logins, 1);
+
+        let send_client_packet = |crypto: &mut EncryptionContext, packets: Vec<Vec<u8>>, sequence: u32| {
+            let batch = compress_batch(&encode_batch(&packets), 256);
+            let encrypted = crypto.encrypt(&batch);
+            send_frames(&client, &server, &encrypted, sequence);
+        };
+
+        // Resource packs: HAVE_ALL_PACKS -> ResourcePackStack.
+        let mut response = vec![RESOURCE_PACK_CLIENT_RESPONSE];
+        write_varint(&mut response, 2);
+        write_varint(&mut response, "downloadingfinished".len() as u32);
+        response.extend_from_slice(b"downloadingfinished");
+        send_client_packet(&mut client_crypto, vec![response], 4);
+        let stack = recv_decrypted(&mut client_crypto);
+        assert_eq!(stack[0][0], RESOURCE_PACK_STACK);
+
+        // Chunk radius -> ChunkRadiusUpdated + SetTime.
+        let mut radius = vec![REQUEST_CHUNK_RADIUS];
+        write_varint_signed(&mut radius, 8);
+        radius.push(8);
+        send_client_packet(&mut client_crypto, vec![radius], 5);
+        let updated = recv_decrypted(&mut client_crypto);
+        assert_eq!(updated[0][0], CHUNK_RADIUS_UPDATED);
+        let time = recv_decrypted(&mut client_crypto);
+        assert_eq!(time[0][0], SET_TIME);
+
+        // Disconnect is reported to the server loop.
+        let mut bye = vec![DISCONNECT];
+        write_varint_signed(&mut bye, 0);
+        write_varint(&mut bye, 0);
+        write_varint(&mut bye, 3);
+        bye.extend_from_slice(b"bye");
+        write_varint(&mut bye, 0);
+        send_client_packet(&mut client_crypto, vec![bye], 6);
+        let disconnects = server.take_disconnects();
+        assert_eq!(disconnects.len(), 1);
+        assert_eq!(disconnects[0].name, "Steve");
     }
 
     #[test]

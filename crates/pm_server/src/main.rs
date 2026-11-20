@@ -248,6 +248,7 @@ fn main() {
 
         if let Some(server) = network.as_ref() {
             server.process_packets();
+            state.process_network_events();
             server.set_online_count(state.players.count() as u32);
         }
 
