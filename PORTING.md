@@ -45,6 +45,9 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | NBT-Writer/Reader (Bedrock-Netzwerkformat) | ✅ | `pm_nbt`, Palette + Chunkdaten |
 | UDP-Integrationstest Login → StartGame → Chunk | ✅ | echter Socket, Split-Reassembly |
 | Spawn-Sequenz (`AvailableCommands`, `UpdateAbilities`, `MovePlayer`, `PLAYER_SPAWN`) | ✅ | Client kann Loading-Screen verlassen |
+| Client-Chat (`Text`) + `PlayerChatEvent` | ✅ | Broadcast zurück an alle Clients |
+| Client-Commands (`CommandRequest`) + Preprocess-Event | ✅ | Ausführung über die Command-Map |
+| Server-/Plugin-Nachrichten als `Text`-Pakete | ✅ | `flush_player_messages` sendet echt |
 | Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 

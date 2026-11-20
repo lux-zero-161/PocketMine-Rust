@@ -50,6 +50,8 @@ Verified by `./tools/smoke-test.sh`:
 | `LevelChunk` streaming with palette-packed sub-chunks | ✅ experimental |
 | Jigsaw/VoxelShapes/BiomeDefs/Commands/Abilities packets | ✅ |
 | Spawn sequence: `MovePlayer`, `SetSpawnPosition`, `PLAYER_SPAWN` | ✅ |
+| Client chat (`Text`) and commands (`CommandRequest`) | ✅ |
+| Server/plugin messages as `Text` packets | ✅ |
 | Real vanilla-client verification, entities | ⏳ next |
 | Network NBT writer/reader (`pm_nbt`) | ✅ |
 
@@ -68,10 +70,10 @@ gameplay and protocol coverage.
 | Block/item registry (`bedrock-data`) | 65 % | real hardness/resistance values |
 | World (chunks, sections, block API) | 30 % | flat generator, no LevelDB yet |
 | Player / inventory / gamemodes | 35 % | stacking, permissions attachments |
-| Commands | 35 % | map, aliases, permissions, 19 built-ins |
+| Commands | 40 % | map, aliases, permissions, player command execution |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 70 % | login, resource packs, StartGame, chunks, spawn sequence |
+| Network (RakNet/Bedrock) | 75 % | login, packs, StartGame, chunks, spawn, chat/commands |
 | World (chunks, sections, block API) | 45 % | network chunk encoder added, still no LevelDB |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |

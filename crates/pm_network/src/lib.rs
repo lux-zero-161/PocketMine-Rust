@@ -40,6 +40,7 @@ pub mod protocol {
     pub const RESOURCE_PACK_STACK: u8 = 0x07;
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u8 = 0x08;
     pub const TEXT: u8 = 0x09;
+    pub const COMMAND_REQUEST: u8 = 0x4d;
     pub const SET_TIME: u8 = 0x0a;
     pub const START_GAME: u8 = 0x0b;
     pub const ADD_PLAYER: u8 = 0x0c;
@@ -629,6 +630,8 @@ pub struct BedrockNetworkServer {
     pending_disconnects: std::sync::Mutex<Vec<PendingDisconnect>>,
     pending_start_games: std::sync::Mutex<Vec<SocketAddr>>,
     pending_chunk_requests: std::sync::Mutex<Vec<(SocketAddr, i32)>>,
+    pending_chats: std::sync::Mutex<Vec<(SocketAddr, String)>>,
+    pending_commands: std::sync::Mutex<Vec<(SocketAddr, String)>>,
 }
 
 impl BedrockNetworkServer {
@@ -687,6 +690,8 @@ impl BedrockNetworkServer {
             pending_disconnects: std::sync::Mutex::new(Vec::new()),
             pending_start_games: std::sync::Mutex::new(Vec::new()),
             pending_chunk_requests: std::sync::Mutex::new(Vec::new()),
+            pending_chats: std::sync::Mutex::new(Vec::new()),
+            pending_commands: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -731,6 +736,18 @@ impl BedrockNetworkServer {
     /// Chunk radius requests that the server should answer with chunks.
     pub fn take_chunk_requests(&self) -> Vec<(SocketAddr, i32)> {
         let mut guard = self.pending_chunk_requests.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Chat messages sent by clients.
+    pub fn take_chats(&self) -> Vec<(SocketAddr, String)> {
+        let mut guard = self.pending_chats.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Commands requested by clients (without the leading slash).
+    pub fn take_commands(&self) -> Vec<(SocketAddr, String)> {
+        let mut guard = self.pending_commands.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
@@ -1063,6 +1080,17 @@ impl BedrockNetworkServer {
                 self.send_play_status(addr, PLAY_STATUS_LOGIN_SUCCESS);
                 self.send_resource_packs_info(addr);
             }
+            TEXT => {
+                if let Some(message) = parse_text(body) {
+                    self.pending_chats.lock().unwrap().push((addr, message));
+                }
+            }
+            COMMAND_REQUEST => {
+                let mut offset = 0usize;
+                if let Some(command) = read_string(body, &mut offset) {
+                    self.pending_commands.lock().unwrap().push((addr, command));
+                }
+            }
             RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, body),
             REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, body),
             DISCONNECT => {
@@ -1365,6 +1393,21 @@ fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
     Some(text)
 }
 
+/// Parses an incoming Text packet and returns the chat/raw message.
+pub fn parse_text(packet: &[u8]) -> Option<String> {
+    let mut offset = 0usize;
+    let _needs_translation = *packet.get(offset)?;
+    offset += 1;
+    let _category = *packet.get(offset)?;
+    offset += 1;
+    let kind = *packet.get(offset)?;
+    offset += 1;
+    if matches!(kind, 1 | 2 | 3) {
+        let _source = read_string(packet, &mut offset)?;
+    }
+    read_string(packet, &mut offset)
+}
+
 fn parse_disconnect(packet: &[u8]) -> Option<(String, String)> {
     // reason varint, then type varint (0 = message), then message string
     let mut offset = 0usize;
@@ -1561,6 +1604,11 @@ mod tests {
     use openssl::ec::{EcGroup, EcKey};
     use openssl::nid::Nid;
     use openssl::pkey::PKey;
+
+    fn test_string(out: &mut Vec<u8>, value: &str) {
+        write_varint(out, value.len() as u32);
+        out.extend_from_slice(value.as_bytes());
+    }
 
     fn packet(id: u32, body: Vec<u8>) -> Vec<u8> {
         let mut out = Vec::with_capacity(body.len() + 2);
@@ -2021,6 +2069,26 @@ mod tests {
         let requests = server.take_chunk_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].1, 8);
+
+        // Chat and command packets are queued for the server loop.
+        let mut text = vec![0u8, 1, 1];
+        test_string(&mut text, "Steve");
+        test_string(&mut text, "hello from the client");
+        send_client_packet(&mut client_crypto, vec![packet(TEXT as u32, text)], 6);
+        let chats = server.take_chats();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].1, "hello from the client");
+
+        let mut command = Vec::new();
+        test_string(&mut command, "help");
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(COMMAND_REQUEST as u32, command)],
+            7,
+        );
+        let commands = server.take_commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].1, "help");
 
         // Disconnect is reported to the server loop.
         let mut bye_body = Vec::new();

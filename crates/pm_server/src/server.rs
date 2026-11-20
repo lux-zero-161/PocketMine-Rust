@@ -189,24 +189,51 @@ impl ServerState {
         player
     }
 
-    /// Flushes queued player messages. Until the chat packet encoder lands the
-    /// console mirrors them so plugin output is visible.
+    /// Sends queued player messages as Bedrock `Text` packets.
     pub fn flush_player_messages(&self) {
+        let network = self.network.lock().unwrap().clone();
+        let sessions = self.player_sessions.read().unwrap().clone();
         for player in self.players.online() {
             for message in player.pop_outbox() {
-                if message.starts_with('\u{0}') {
-                    let plain = text::strip_colors(&message.replace('\u{0}', " | "));
-                    self.logger.info(&format!(
-                        "[{}] {}",
-                        player.name,
-                        plain.trim_start_matches(" | ")
-                    ));
+                let plain = if message.starts_with('\u{0}') {
+                    text::strip_colors(&message.replace('\u{0}', " | "))
                 } else {
-                    self.logger
-                        .info(&format!("[{}] {}", player.name, text::to_ansi(&message)));
+                    message.clone()
+                };
+                match (
+                    network.as_ref(),
+                    sessions.get(&player.name.to_ascii_lowercase()),
+                ) {
+                    (Some(network), Some(address)) => {
+                        network.send_packets(
+                            *address,
+                            vec![crate::protocol::text_packet(&plain, None)],
+                            None,
+                        );
+                    }
+                    _ => self
+                        .logger
+                        .info(&format!("[{}] {}", player.name, text::to_ansi(&plain))),
                 }
             }
         }
+    }
+
+    fn broadcast_text(&self, line: &str, source: Option<&str>) {
+        let network = self.network.lock().unwrap().clone();
+        let sessions = self.player_sessions.read().unwrap().clone();
+        if let Some(network) = network {
+            for player in self.players.online() {
+                if let Some(address) = sessions.get(&player.name.to_ascii_lowercase()) {
+                    network.send_packets(
+                        *address,
+                        vec![crate::protocol::text_packet(line, source)],
+                        None,
+                    );
+                }
+            }
+        }
+        self.logger.info(line);
     }
 
     /// Turns network login/disconnect events into real player sessions and
@@ -318,6 +345,50 @@ impl ServerState {
             }
             for (address, radius) in network.take_chunk_requests() {
                 self.send_chunks_for(address, radius);
+            }
+
+            for (address, message) in network.take_chats() {
+                let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
+                    continue;
+                };
+                let Some(player) = self.players.get(&name) else {
+                    continue;
+                };
+                let mut event = pm_event::PlayerChatEvent::new(
+                    player.name.clone(),
+                    player.uuid.clone(),
+                    message,
+                    "<{0}> {1}".to_string(),
+                );
+                let cancelled = self.dispatch(&mut event);
+                if !cancelled {
+                    let format = if event.format.is_empty() {
+                        "<{0}> {1}".to_string()
+                    } else {
+                        event.format.clone()
+                    };
+                    let line = format
+                        .replace("{0}", &player.name)
+                        .replace("{1}", &event.message);
+                    self.broadcast_text(&line, None);
+                }
+            }
+
+            for (address, command) in network.take_commands() {
+                let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
+                    continue;
+                };
+                let Some(player) = self.players.get(&name) else {
+                    continue;
+                };
+                let mut event = pm_event::PlayerCommandPreprocessEvent::new(
+                    player.name.clone(),
+                    format!("/{}", command),
+                );
+                if !self.dispatch(&mut event) {
+                    let command = event.message.trim_start_matches('/');
+                    self.commands.execute(&*player, command);
+                }
             }
         }
     }

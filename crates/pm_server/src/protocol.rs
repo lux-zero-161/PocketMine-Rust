@@ -19,6 +19,7 @@ pub const ITEM_REGISTRY_PACKET: u32 = 0xa2;
 pub const JIGSAW_STRUCTURE_DATA_PACKET: u32 = 0x139;
 pub const VOXEL_SHAPES_PACKET: u32 = 0x151;
 pub const PLAY_STATUS_PACKET: u32 = 0x02;
+pub const TEXT_PACKET: u32 = 0x09;
 pub const MOVE_PLAYER_PACKET: u32 = 0x13;
 pub const SET_SPAWN_POSITION_PACKET: u32 = 0x2b;
 pub const SET_DIFFICULTY_PACKET: u32 = 0x3c;
@@ -480,6 +481,25 @@ pub fn spawn_packets(player: &Player, world: &World, tick: u64) -> Vec<Vec<u8>> 
         play_status_packet(PLAY_STATUS_PLAYER_SPAWN),
         set_time_packet(world.time()),
     ]
+}
+
+pub fn text_packet(message: &str, source: Option<&str>) -> Vec<u8> {
+    let mut body = Vec::with_capacity(message.len() + 16);
+    body.push(0); // no translation
+    if let Some(source) = source {
+        body.push(1); // category: authored message
+        body.push(1); // type: chat
+        put_string(&mut body, source);
+        put_string(&mut body, message);
+    } else {
+        body.push(0); // category: message only
+        body.push(0); // type: raw
+        put_string(&mut body, message);
+    }
+    put_string(&mut body, ""); // xuid
+    put_string(&mut body, ""); // platform chat id
+    body.push(0); // filtered message absent
+    packet(TEXT_PACKET, body)
 }
 
 pub fn play_status_packet(status: i32) -> Vec<u8> {
