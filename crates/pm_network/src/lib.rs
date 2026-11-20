@@ -605,8 +605,18 @@ pub struct LoginIdentity {
     pub client_public_key: Option<Vec<u8>>,
 }
 
-/// Movement state from `PlayerAuthInputPacket`.
+/// Block action embedded in `PlayerAuthInputPacket`.
 #[derive(Debug, Clone, Copy)]
+pub struct AuthBlockAction {
+    pub action: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub face: i32,
+}
+
+/// Movement state from `PlayerAuthInputPacket`.
+#[derive(Debug, Clone)]
 pub struct PendingMovement {
     pub address: SocketAddr,
     pub x: f64,
@@ -615,6 +625,7 @@ pub struct PendingMovement {
     pub yaw: f32,
     pub pitch: f32,
     pub head_yaw: f32,
+    pub block_actions: Vec<AuthBlockAction>,
 }
 
 /// Block placement request from `InventoryTransactionPacket` (use item on block).
@@ -1488,24 +1499,24 @@ fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
     Some(text)
 }
 
-/// Parses the leading fields of `PlayerAuthInputPacket`: pitch, yaw, position
-/// and head yaw. The remaining input flags/actions are not needed for movement.
+/// Parses `PlayerAuthInputPacket`: movement prefix plus optional block actions.
 pub fn parse_auth_input(address: SocketAddr, body: &[u8]) -> Option<PendingMovement> {
     let mut offset = 0usize;
-    let mut float = || -> Option<f32> {
-        let bytes = body.get(offset..offset + 4)?;
-        offset += 4;
+    let float = |offset: &mut usize| -> Option<f32> {
+        let bytes = body.get(*offset..*offset + 4)?;
+        *offset += 4;
         Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
-    let pitch = float()?;
-    let yaw = float()?;
-    let x = float()? as f64;
-    let y = float()? as f64;
-    let z = float()? as f64;
-    let _move_x = float()?;
-    let _move_z = float()?;
-    let head_yaw = float()?;
-    Some(PendingMovement {
+    let pitch = float(&mut offset)?;
+    let yaw = float(&mut offset)?;
+    let x = float(&mut offset)? as f64;
+    let y = float(&mut offset)? as f64;
+    let z = float(&mut offset)? as f64;
+    let _move_x = float(&mut offset)?;
+    let _move_z = float(&mut offset)?;
+    let head_yaw = float(&mut offset)?;
+
+    let mut movement = PendingMovement {
         address,
         x,
         y,
@@ -1513,7 +1524,65 @@ pub fn parse_auth_input(address: SocketAddr, body: &[u8]) -> Option<PendingMovem
         yaw,
         pitch,
         head_yaw,
-    })
+        block_actions: Vec::new(),
+    };
+    if let Some(actions) = parse_auth_input_actions(body, &mut offset) {
+        movement.block_actions = actions;
+    }
+    Some(movement)
+}
+
+fn parse_auth_input_actions(body: &[u8], offset: &mut usize) -> Option<Vec<AuthBlockAction>> {
+    // input flags (list of signed varints)
+    let flag_count = read_varint(body, offset)?;
+    for _ in 0..flag_count {
+        read_varint_signed(body, offset)?;
+    }
+    let _input_mode = read_varint(body, offset)?;
+    let _play_mode = read_varint(body, offset)?;
+    let _interaction_mode = read_varint_signed(body, offset)?;
+    for _ in 0..2 {
+        body.get(*offset..*offset + 4)?;
+        *offset += 4;
+    }
+    let _tick = read_varlong(body, offset)?;
+    for _ in 0..3 {
+        body.get(*offset..*offset + 4)?;
+        *offset += 4;
+    }
+
+    // Optional item interaction data and item stack request: not parsed, bail.
+    if *body.get(*offset)? != 0 {
+        return None;
+    }
+    *offset += 1;
+    if *body.get(*offset)? != 0 {
+        return None;
+    }
+    *offset += 1;
+
+    let has_actions = *body.get(*offset)?;
+    *offset += 1;
+    if has_actions == 0 {
+        return Some(Vec::new());
+    }
+    let count = read_varint(body, offset)?;
+    let mut actions = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let action = read_varint_signed(body, offset)?;
+        let x = read_varint_signed(body, offset)?;
+        let y = read_varint_signed(body, offset)?;
+        let z = read_varint_signed(body, offset)?;
+        let face = read_varint_signed(body, offset)?;
+        actions.push(AuthBlockAction {
+            action,
+            x,
+            y,
+            z,
+            face,
+        });
+    }
+    Some(actions)
 }
 
 /// Parses the leading fields of `InventoryTransactionPacket` for use-item-on-block.

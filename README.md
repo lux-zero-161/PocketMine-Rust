@@ -76,7 +76,7 @@ gameplay and protocol coverage.
 | Events | 30 % | core events incl. block break/place, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
 | Network (RakNet/Bedrock) | 85 % | login, spawn, chunks, chat, block updates, movement |
-| World (chunks, sections, block API) | 55 % | chunk encoder, break/place, still no LevelDB |
+| World (chunks, sections, block API) | 65 % | chunk encoder, break/place, interim binary persistence |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
@@ -88,7 +88,8 @@ gameplay and protocol coverage.
    radius, StartGame, palettes, chunk streaming~~ – implemented. Next: verify
    against a real 1.26.60 client and fix protocol details (biome definitions,
    item component NBT, available commands).
-2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates.
+2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates
+   (an interim `worlds/<name>/chunks.bin` format already persists edits).
 3. **M3 Gameplay:** entities, physics, damage/death, inventory transactions.
 4. **M4 API parity:** all PMMP events, form API, command parser, selectors.
 5. **M5 Operations:** timings, crash dumps, resource packs, Query/RCON, CI.
@@ -314,6 +315,7 @@ plugin folder, and supports dependency ordering via `Depends`/`depend`.
 | `/tp <player> <x> <y> <z>`, `/kill <player>` | movement and damage |
 | `/world <info\|list\|time\|settime\|getblock\|setblock\|tp>` | world and block access |
 | `/event <join\|quit\|chat\|break\|place\|damage\|death\|respawn>` | dispatch a test event to plugins |
+| `/save` | save all loaded worlds (autosave every 5 min) |
 | `/reload` | disable, reload and re-enable plugins |
 | `/stop` | save worlds and shut down |
 | `/csharp`, `/hello`, `/build`, `/inv` | provided by `ExamplePlugin` |

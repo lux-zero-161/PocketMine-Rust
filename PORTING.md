@@ -51,7 +51,9 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | Block-Abbau (`PlayerAction`) + `UpdateBlock`-Broadcast | ✅ | Creative/Survival-Abbau, Event |
 | Block-Platzierung (`InventoryTransaction` UseItemOn) | ✅ | Item aus dem Paket, Event, Broadcast |
 | Bewegung (`PlayerAuthInput`) + `PlayerMoveEvent` | ✅ | Position/Rotation, Broadcast an andere Spieler |
-| Block-Actions innerhalb `PlayerAuthInput` | ⏳ | für 1.26.40+ noch nicht geparst |
+| Block-Actions innerhalb `PlayerAuthInput` | ✅ | Bewegung + Block-Aktionen aus einem Paket |
+| Welt-Persistenz (`world.json` + `chunks.bin`) | ✅ | Zwischenformat, Autosave, `/save` |
+| Bedrock-LevelDB-Weltformat | ⏳ | langfristiges Ziel (M2) |
 | Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 

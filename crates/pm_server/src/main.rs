@@ -260,6 +260,11 @@ fn main() {
         }
         state.flush_player_messages();
 
+        if state.props.auto_save && tick % 6000 == 0 {
+            logger.debug("Autosaving worlds...");
+            state.save_worlds();
+        }
+
         let elapsed = tick_start.elapsed();
         state.record_tick(elapsed.as_secs_f64() * 1000.0);
 

@@ -160,12 +160,16 @@ impl ServerState {
     /// Creates the default world from the configuration and loads spawn chunks.
     pub fn prepare_default_world(&self) {
         let name = self.props.level_name.clone();
-        let world = Arc::new(World::flat(name.clone()));
-        world.load_chunks_around(world.spawn, 2);
+        let path = format!("{}/{}", self.worlds_path.read().unwrap(), name);
+        let world = Arc::new(World::load_or_generate(
+            std::path::Path::new(&path),
+            name.clone(),
+        ));
         self.worlds.register(world.clone(), true);
         self.logger.info(&format!(
-            "Prepared level \"{}\" ({} chunks loaded, flat generator, seed {})",
+            "Prepared level \"{}\" from '{}' ({} chunks loaded, seed {})",
             name,
+            path,
             world.loaded_chunk_count(),
             world.seed
         ));
@@ -509,6 +513,16 @@ impl ServerState {
         *player.yaw.write().unwrap() = movement.yaw as f64;
         *player.pitch.write().unwrap() = movement.pitch as f64;
         self.broadcast_move(&player, movement.address);
+        for action in movement.block_actions {
+            self.handle_block_action(pm_network::PendingBlockAction {
+                address: movement.address,
+                action: action.action,
+                x: action.x,
+                y: action.y,
+                z: action.z,
+                face: action.face,
+            });
+        }
     }
 
     fn broadcast_move(&self, player: &Arc<Player>, except: SocketAddr) {
@@ -1070,6 +1084,7 @@ mod block_tests {
             yaw: 90.0,
             pitch: 15.0,
             head_yaw: 90.0,
+            block_actions: Vec::new(),
         });
         let player = state.players.get("Steve").unwrap();
         assert_eq!(player.position(), pm_math::Vector3::new(10.5, 5.0, -2.5));

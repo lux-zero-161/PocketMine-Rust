@@ -807,6 +807,37 @@ impl Command for OpCommand {
     }
 }
 
+pub struct SaveCommand {
+    state: Arc<ServerState>,
+}
+
+impl SaveCommand {
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Command for SaveCommand {
+    fn name(&self) -> &str {
+        "save"
+    }
+    fn description(&self) -> &str {
+        "Saves all loaded worlds"
+    }
+    fn usage(&self) -> &str {
+        "/save"
+    }
+    fn aliases(&self) -> &[String] {
+        const ALIASES: &[String] = &[];
+        ALIASES
+    }
+    fn execute(&self, sender: &dyn CommandSender, _label: &str, _args: &[&str]) -> bool {
+        self.state.save_worlds();
+        sender.send_message("§aWorlds saved.");
+        true
+    }
+}
+
 pub struct ReloadCommand {
     state: Arc<ServerState>,
 }
@@ -911,6 +942,7 @@ pub fn register_default_commands(state: &Arc<ServerState>) {
         Arc::new(GiveCommand::new(state.clone())),
         Arc::new(TeleportCommand::new(state.clone())),
         Arc::new(KillCommand::new(state.clone())),
+        Arc::new(SaveCommand::new(state.clone())),
     ];
     for command in commands {
         state.commands.register(command);

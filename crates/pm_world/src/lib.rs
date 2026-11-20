@@ -687,7 +687,8 @@ impl World {
         }
     }
 
-    /// Saves world metadata as JSON (chunk persistence is a later milestone).
+    /// Saves world metadata and every loaded chunk in the interim binary format
+    /// (`world.json` + `chunks.bin`). Bedrock LevelDB is the long-term target.
     pub fn save(&self, directory: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(directory)?;
         let meta = serde_json::json!({
@@ -697,12 +698,209 @@ impl World {
             "time": self.time(),
             "difficulty": self.difficulty as u8,
             "generator": self.generator.name(),
-            "loaded_chunks": self.loaded_chunk_count(),
         });
         std::fs::write(
             directory.join("world.json"),
             serde_json::to_string_pretty(&meta)?,
-        )
+        )?;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"PMRW");
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&self.seed.to_le_bytes());
+        out.extend_from_slice(&self.time().to_le_bytes());
+        for value in [self.spawn.x, self.spawn.y, self.spawn.z] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let chunks = self.chunks.read().unwrap();
+        out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+        for chunk in chunks.values() {
+            out.extend_from_slice(&chunk.x.to_le_bytes());
+            out.extend_from_slice(&chunk.z.to_le_bytes());
+            for biome in chunk.biomes.iter() {
+                out.extend_from_slice(&biome.to_le_bytes());
+            }
+            let sections: Vec<(u8, &SubChunk)> = chunk
+                .sections()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, section)| {
+                    section
+                        .as_ref()
+                        .filter(|section| !section.is_empty())
+                        .map(|section| (index as u8, section))
+                })
+                .collect();
+            out.extend_from_slice(&(sections.len() as u16).to_le_bytes());
+            for (index, section) in sections {
+                out.push(index);
+                out.extend_from_slice(&(section.palette().len() as u16).to_le_bytes());
+                for block in section.palette() {
+                    out.extend_from_slice(&block.id.to_le_bytes());
+                    out.extend_from_slice(&block.meta.to_le_bytes());
+                }
+                for value in section.palette_indices().iter() {
+                    out.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        std::fs::write(directory.join("chunks.bin"), out)
+    }
+
+    /// Loads a world saved by [`World::save`], or creates a fresh flat world.
+    pub fn load_or_generate(directory: &std::path::Path, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let mut world = Self::flat(name);
+
+        if let Ok(text) = std::fs::read_to_string(directory.join("world.json")) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(seed) = meta.get("seed").and_then(serde_json::Value::as_i64) {
+                    world.seed = seed;
+                }
+                if let Some(time) = meta.get("time").and_then(serde_json::Value::as_i64) {
+                    *world.time.write().unwrap() = time;
+                }
+                if let Some(difficulty) = meta.get("difficulty").and_then(serde_json::Value::as_u64)
+                {
+                    world.difficulty = match difficulty {
+                        0 => Difficulty::Peaceful,
+                        1 => Difficulty::Easy,
+                        2 => Difficulty::Normal,
+                        _ => Difficulty::Hard,
+                    };
+                }
+                if let Some(spawn) = meta.get("spawn") {
+                    let axis = |key: &str| {
+                        spawn
+                            .get(key)
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0)
+                    };
+                    world.spawn = Vector3::new(axis("x"), axis("y"), axis("z"));
+                }
+            }
+        }
+
+        if let Ok(bytes) = std::fs::read(directory.join("chunks.bin")) {
+            if world.apply_chunk_dump(&bytes) {
+                return world;
+            }
+        }
+
+        world.load_chunks_around(world.spawn, 2);
+        world
+    }
+
+    fn apply_chunk_dump(&mut self, bytes: &[u8]) -> bool {
+        let mut offset = 0usize;
+        let take = |offset: &mut usize, count: usize| -> Option<&[u8]> {
+            let slice = bytes.get(*offset..*offset + count)?;
+            *offset += count;
+            Some(slice)
+        };
+        let Some(magic) = take(&mut offset, 4) else {
+            return false;
+        };
+        if magic != b"PMRW" {
+            return false;
+        }
+        let Some(version) = take(&mut offset, 4) else {
+            return false;
+        };
+        if u32::from_le_bytes(version.try_into().unwrap()) != 1 {
+            return false;
+        }
+        let Some(seed) = take(&mut offset, 8) else {
+            return false;
+        };
+        self.seed = i64::from_le_bytes(seed.try_into().unwrap());
+        let Some(time) = take(&mut offset, 8) else {
+            return false;
+        };
+        *self.time.write().unwrap() = i64::from_le_bytes(time.try_into().unwrap());
+        for axis in 0..3 {
+            let Some(value) = take(&mut offset, 8) else {
+                return false;
+            };
+            let value = f64::from_le_bytes(value.try_into().unwrap());
+            match axis {
+                0 => self.spawn.x = value,
+                1 => self.spawn.y = value,
+                _ => self.spawn.z = value,
+            }
+        }
+
+        let Some(count) = take(&mut offset, 4) else {
+            return false;
+        };
+        let count = u32::from_le_bytes(count.try_into().unwrap()) as usize;
+        let mut chunks = self.chunks.write().unwrap();
+        chunks.clear();
+        for _ in 0..count {
+            let Some(x) = take(&mut offset, 4) else {
+                return false;
+            };
+            let Some(z) = take(&mut offset, 4) else {
+                return false;
+            };
+            let (x, z) = (
+                i32::from_le_bytes(x.try_into().unwrap()),
+                i32::from_le_bytes(z.try_into().unwrap()),
+            );
+            let mut chunk = Chunk::new(x, z);
+            let Some(biomes) = take(&mut offset, 512) else {
+                return false;
+            };
+            for (index, biome) in chunk.biomes.iter_mut().enumerate() {
+                *biome = u16::from_le_bytes([biomes[index * 2], biomes[index * 2 + 1]]);
+            }
+            let Some(section_count) = take(&mut offset, 2) else {
+                return false;
+            };
+            let section_count = u16::from_le_bytes(section_count.try_into().unwrap());
+            for _ in 0..section_count {
+                let Some(index) = take(&mut offset, 1) else {
+                    return false;
+                };
+                let Some(palette_len) = take(&mut offset, 2) else {
+                    return false;
+                };
+                let palette_len = u16::from_le_bytes(palette_len.try_into().unwrap()) as usize;
+                let mut palette = Vec::with_capacity(palette_len);
+                for _ in 0..palette_len {
+                    let Some(block) = take(&mut offset, 4) else {
+                        return false;
+                    };
+                    palette.push(Block {
+                        id: u16::from_le_bytes([block[0], block[1]]),
+                        meta: u16::from_le_bytes([block[2], block[3]]),
+                    });
+                }
+                let Some(indices) = take(&mut offset, 8192) else {
+                    return false;
+                };
+                let section_index = index[0] as i32;
+                for position in 0..4096usize {
+                    let palette_index =
+                        u16::from_le_bytes([indices[position * 2], indices[position * 2 + 1]])
+                            as usize;
+                    let Some(block) = palette.get(palette_index) else {
+                        continue;
+                    };
+                    if block.is_air() {
+                        continue;
+                    }
+                    let local_x = (position & 15) as i32;
+                    let local_z = ((position >> 4) & 15) as i32;
+                    let local_y = ((position >> 8) & 15) as i32;
+                    let y = WORLD_MIN_Y + section_index * 16 + local_y;
+                    chunk.set_block(local_x, y, local_z, *block);
+                }
+            }
+            chunks.insert((x, z), chunk);
+        }
+        true
     }
 }
 
@@ -798,5 +996,33 @@ mod tests {
         assert!(world.get_block_at(1, 40, 1).is_solid());
         world.set_block_at(1, 40, 1, blocks::air());
         assert!(world.get_block_at(1, 40, 1).is_air());
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn saves_and_loads_chunks() {
+        let dir = std::env::temp_dir().join(format!("pm_world_persist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let world = World::flat("persist");
+        world.load_chunk(0, 0);
+        world.set_block_at(5, 20, 5, Block::of("minecraft:diamond_block"));
+        world.set_time(1234);
+        world.save(&dir).unwrap();
+
+        let loaded = World::load_or_generate(&dir, "persist");
+        assert_eq!(loaded.time(), 1234);
+        assert_eq!(
+            loaded.get_block_at(5, 20, 5).name(),
+            "minecraft:diamond_block"
+        );
+        assert_eq!(loaded.get_block_at(0, 0, 0).name(), "minecraft:bedrock");
+        assert!(loaded.is_chunk_loaded(0, 0));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
