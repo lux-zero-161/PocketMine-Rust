@@ -1,0 +1,8 @@
+[package]
+name = "pm_nbt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PocketMine-Rust NBT writer/reader (Bedrock network NBT)"
+
+[dependencies]

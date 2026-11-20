@@ -4,6 +4,7 @@ members = [
     "crates/pm_core",
     "crates/pm_math",
     "crates/pm_data",
+    "crates/pm_nbt",
     "crates/pm_event",
     "crates/pm_permission",
     "crates/pm_command",

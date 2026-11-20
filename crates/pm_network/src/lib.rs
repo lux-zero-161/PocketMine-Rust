@@ -16,7 +16,9 @@ pub mod encryption;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use encryption::{create_handshake_jwt, derive_aes_key, derive_shared_secret, random_salt, EncryptionContext};
+use encryption::{
+    create_handshake_jwt, derive_aes_key, derive_shared_secret, random_salt, EncryptionContext,
+};
 use openssl::pkey::{PKey, Private};
 use pm_core::{Logger, RAKNET_MAGIC};
 use serde_json::Value;
@@ -310,7 +312,7 @@ impl Frame {
     }
 }
 
-fn decode_frames(buf: &[u8]) -> Vec<Frame> {
+pub fn decode_frames(buf: &[u8]) -> Vec<Frame> {
     let mut frames = Vec::new();
     let mut i = 0usize;
     while i + 3 <= buf.len() {
@@ -331,15 +333,30 @@ fn decode_frames(buf: &[u8]) -> Vec<Frame> {
         let mut order_channel = None;
 
         if reliable && i + 4 <= buf.len() {
-            reliable_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+            reliable_index = Some(u32::from_le_bytes([
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+            ]));
             i += 4;
         }
         if sequenced && i + 4 <= buf.len() {
-            sequence_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+            sequence_index = Some(u32::from_le_bytes([
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+            ]));
             i += 4;
         }
         if ordered && i + 5 <= buf.len() {
-            order_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
+            order_index = Some(u32::from_le_bytes([
+                buf[i],
+                buf[i + 1],
+                buf[i + 2],
+                buf[i + 3],
+            ]));
             order_channel = Some(buf[i + 4]);
             i += 5;
         }
@@ -403,7 +420,11 @@ pub struct SplitAssembly {
 
 impl SplitAssembly {
     pub fn new(count: u32) -> Self {
-        Self { count, received: 0, parts: vec![None; count as usize] }
+        Self {
+            count,
+            received: 0,
+            parts: vec![None; count as usize],
+        }
     }
 
     /// Returns the complete payload once every fragment has arrived.
@@ -426,10 +447,21 @@ impl SplitAssembly {
 }
 
 /// Splits a payload into frames small enough for the given MTU.
-pub fn split_payload(payload: &[u8], mtu: usize, reliable_start: u32, order_start: u32) -> Vec<Frame> {
-    let max = mtu.saturating_sub(DATAGRAM_HEADER_SIZE + 3 + 10 + 5 + 32).max(256);
+pub fn split_payload(
+    payload: &[u8],
+    mtu: usize,
+    reliable_start: u32,
+    order_start: u32,
+) -> Vec<Frame> {
+    let max = mtu
+        .saturating_sub(DATAGRAM_HEADER_SIZE + 3 + 10 + 5 + 32)
+        .max(256);
     if payload.len() <= max {
-        return vec![Frame::reliable_ordered(payload.to_vec(), reliable_start, order_start)];
+        return vec![Frame::reliable_ordered(
+            payload.to_vec(),
+            reliable_start,
+            order_start,
+        )];
     }
     let count = payload.len().div_ceil(max);
     let split_id = (reliable_start & 0xffff) as u16;
@@ -538,7 +570,6 @@ impl Session {
         self.datagram_sequence = self.datagram_sequence.wrapping_add(1) & 0x00ff_ffff;
         seq
     }
-
 }
 
 /// Identity extracted from an offline-mode Login packet.
@@ -596,20 +627,31 @@ pub struct BedrockNetworkServer {
     server_key: Arc<PKey<Private>>,
     pending_logins: std::sync::Mutex<Vec<PendingLogin>>,
     pending_disconnects: std::sync::Mutex<Vec<PendingDisconnect>>,
+    pending_start_games: std::sync::Mutex<Vec<SocketAddr>>,
+    pending_chunk_requests: std::sync::Mutex<Vec<(SocketAddr, i32)>>,
 }
 
 impl BedrockNetworkServer {
-    pub fn bind(bind_addr: &str, motd: &str, max_players: usize, logger: Arc<Logger>) -> io::Result<Self> {
+    pub fn bind(
+        bind_addr: &str,
+        motd: &str,
+        max_players: usize,
+        logger: Arc<Logger>,
+    ) -> io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr)?;
         socket.set_nonblocking(true)?;
         let local = socket.local_addr()?;
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
         let guid = (now.as_nanos() as i64).wrapping_mul(31) | 1;
-        let server_key = Arc::new(
-            encryption::generate_server_key()
-                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("ECDH key generation failed: {err}")))?,
-        );
+        let server_key = Arc::new(encryption::generate_server_key().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("ECDH key generation failed: {err}"),
+            )
+        })?);
 
         let pong = PongData {
             motd: motd.to_string(),
@@ -643,6 +685,8 @@ impl BedrockNetworkServer {
             server_key,
             pending_logins: std::sync::Mutex::new(Vec::new()),
             pending_disconnects: std::sync::Mutex::new(Vec::new()),
+            pending_start_games: std::sync::Mutex::new(Vec::new()),
+            pending_chunk_requests: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -675,6 +719,18 @@ impl BedrockNetworkServer {
     /// Removes and returns clients that disconnected.
     pub fn take_disconnects(&self) -> Vec<PendingDisconnect> {
         let mut guard = self.pending_disconnects.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Clients that finished the resource-pack stack and are ready for StartGame.
+    pub fn take_start_games(&self) -> Vec<SocketAddr> {
+        let mut guard = self.pending_start_games.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Chunk radius requests that the server should answer with chunks.
+    pub fn take_chunk_requests(&self) -> Vec<(SocketAddr, i32)> {
+        let mut guard = self.pending_chunk_requests.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
@@ -812,7 +868,10 @@ impl BedrockNetworkServer {
         out.push(0);
         let _ = self.socket.send_to(&out, addr);
 
-        self.sessions.write().unwrap().insert(addr, Session::new(addr, mtu));
+        self.sessions
+            .write()
+            .unwrap()
+            .insert(addr, Session::new(addr, mtu));
         self.stats.write().unwrap().handshakes += 1;
     }
 
@@ -837,7 +896,8 @@ impl BedrockNetworkServer {
         if let Some(session) = self.sessions.write().unwrap().get_mut(&addr) {
             session.state = SessionState::Connected;
         }
-        self.logger.debug(&format!("RakNet client connected: {}", addr));
+        self.logger
+            .debug(&format!("RakNet client connected: {}", addr));
     }
 
     fn handle_datagram_frame(&self, addr: SocketAddr, data: &[u8]) {
@@ -849,7 +909,10 @@ impl BedrockNetworkServer {
 
         let compression_enabled = {
             let sessions = self.sessions.read().unwrap();
-            sessions.get(&addr).map(|s| s.compression_enabled).unwrap_or(false)
+            sessions
+                .get(&addr)
+                .map(|s| s.compression_enabled)
+                .unwrap_or(false)
         };
 
         {
@@ -861,7 +924,9 @@ impl BedrockNetworkServer {
         for frame in frames {
             let payload = if frame.is_split() {
                 let mut sessions = self.sessions.write().unwrap();
-                let Some(session) = sessions.get_mut(&addr) else { continue };
+                let Some(session) = sessions.get_mut(&addr) else {
+                    continue;
+                };
                 let assembly = session
                     .split_assemblies
                     .entry(frame.split_id)
@@ -887,20 +952,28 @@ impl BedrockNetworkServer {
     fn handle_payload(&self, addr: SocketAddr, payload: &[u8], compression_enabled: bool) {
         let encrypted = {
             let sessions = self.sessions.read().unwrap();
-            sessions.get(&addr).map(|s| s.encryption.is_some()).unwrap_or(false)
+            sessions
+                .get(&addr)
+                .map(|s| s.encryption.is_some())
+                .unwrap_or(false)
         };
         let decrypted;
         let payload = if encrypted {
             let mut sessions = self.sessions.write().unwrap();
-            let Some(session) = sessions.get_mut(&addr) else { return };
-            let Some(context) = session.encryption.as_mut() else { return };
+            let Some(session) = sessions.get_mut(&addr) else {
+                return;
+            };
+            let Some(context) = session.encryption.as_mut() else {
+                return;
+            };
             match context.decrypt(payload) {
                 Ok(data) => {
                     decrypted = data;
                     decrypted.as_slice()
                 }
                 Err(err) => {
-                    self.logger.debug(&format!("Decryption failed for {}: {}", addr, err));
+                    self.logger
+                        .debug(&format!("Decryption failed for {}: {}", addr, err));
                     self.disconnect(addr);
                     return;
                 }
@@ -913,7 +986,8 @@ impl BedrockNetworkServer {
             match decompress_batch(payload) {
                 Ok(batch) => batch,
                 Err(err) => {
-                    self.logger.debug(&format!("Bad compressed batch from {}: {}", addr, err));
+                    self.logger
+                        .debug(&format!("Bad compressed batch from {}: {}", addr, err));
                     return;
                 }
             }
@@ -924,7 +998,8 @@ impl BedrockNetworkServer {
         let packets = match decode_batch(&batch) {
             Ok(packets) => packets,
             Err(err) => {
-                self.logger.debug(&format!("Bad packet batch from {}: {}", addr, err));
+                self.logger
+                    .debug(&format!("Bad packet batch from {}: {}", addr, err));
                 return;
             }
         };
@@ -934,16 +1009,28 @@ impl BedrockNetworkServer {
             if packet.is_empty() {
                 continue;
             }
-            self.handle_packet(addr, &packet);
+            let mut offset = 0usize;
+            let Some(packet_id) = read_varint(&packet, &mut offset) else {
+                continue;
+            };
+            self.handle_packet(addr, packet_id, &packet[offset..]);
         }
     }
 
-    fn handle_packet(&self, addr: SocketAddr, packet: &[u8]) {
-        match packet[0] {
+    fn handle_packet(&self, addr: SocketAddr, packet_id: u32, body: &[u8]) {
+        if packet_id > u8::MAX as u32 {
+            self.stats.write().unwrap().unknown_packets += 1;
+            self.logger.debug(&format!(
+                "Unhandled Bedrock packet id 0x{:x} from {}",
+                packet_id, addr
+            ));
+            return;
+        }
+        match packet_id as u8 {
             REQUEST_NETWORK_SETTINGS => self.send_network_settings(addr),
             LOGIN => {
                 self.stats.write().unwrap().logins += 1;
-                match parse_login(packet) {
+                match parse_login(body) {
                     Some(identity) => {
                         self.logger.info(&format!(
                             "Login attempt from {}: \"{}\" ({}) protocol {}",
@@ -963,39 +1050,48 @@ impl BedrockNetworkServer {
                         }
                     }
                     None => {
-                        self.logger.debug(&format!("Could not parse Login packet from {}", addr));
+                        self.logger
+                            .debug(&format!("Could not parse Login packet from {}", addr));
                         self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
                     }
                 }
             }
             CLIENT_TO_SERVER_HANDSHAKE => {
                 self.stats.write().unwrap().encryptions += 1;
-                self.logger.info(&format!("Encryption handshake completed for {}", addr));
+                self.logger
+                    .info(&format!("Encryption handshake completed for {}", addr));
                 self.send_play_status(addr, PLAY_STATUS_LOGIN_SUCCESS);
                 self.send_resource_packs_info(addr);
             }
-            RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, packet),
-            REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, packet),
+            RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, body),
+            REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, body),
             DISCONNECT => {
-                if let Some((name, _message)) = parse_disconnect(packet) {
-                    self.logger.info(&format!("Client {} disconnected: {}", addr, name));
+                if let Some((name, _message)) = parse_disconnect(body) {
+                    self.logger
+                        .info(&format!("Client {} disconnected: {}", addr, name));
                 }
                 self.disconnect(addr);
             }
             SET_LOCAL_PLAYER_AS_INITIALIZED => {
-                self.logger.info(&format!("Client {} spawned (SetLocalPlayerAsInitialized)", addr));
+                self.logger.info(&format!(
+                    "Client {} spawned (SetLocalPlayerAsInitialized)",
+                    addr
+                ));
             }
             _ => {
+                let mut full = Vec::with_capacity(body.len() + 2);
+                write_varint(&mut full, packet_id);
+                full.extend_from_slice(body);
                 if let Some(handler) = self.packet_handler.write().unwrap().as_mut() {
-                    handler(addr, packet);
+                    handler(addr, &full);
                 }
             }
         }
     }
 
     fn send_network_settings(&self, addr: SocketAddr) {
-        let mut payload = Vec::with_capacity(7);
-        payload.push(NETWORK_SETTINGS);
+        let mut payload = Vec::with_capacity(8);
+        write_varint(&mut payload, NETWORK_SETTINGS as u32);
         payload.extend_from_slice(&256u16.to_le_bytes()); // threshold
         payload.extend_from_slice(&0u16.to_le_bytes()); // zlib
         payload.extend_from_slice(&256u16.to_le_bytes()); // client threshold
@@ -1011,14 +1107,14 @@ impl BedrockNetworkServer {
 
     fn send_play_status(&self, addr: SocketAddr, status: i32) {
         let mut payload = Vec::with_capacity(5);
-        payload.push(PLAY_STATUS);
+        write_varint(&mut payload, PLAY_STATUS as u32);
         payload.extend_from_slice(&status.to_be_bytes());
         self.send_packets(addr, vec![payload], None);
     }
 
     fn send_disconnect(&self, addr: SocketAddr, message: &str) {
         let mut payload = Vec::new();
-        payload.push(DISCONNECT);
+        write_varint(&mut payload, DISCONNECT as u32);
         write_varint(&mut payload, 0); // reason: unknown
         write_varint(&mut payload, 0); // type: message present
         write_varint(&mut payload, message.len() as u32);
@@ -1029,7 +1125,7 @@ impl BedrockNetworkServer {
 
     fn send_resource_packs_info(&self, addr: SocketAddr) {
         let mut payload = Vec::with_capacity(32);
-        payload.push(RESOURCE_PACKS_INFO);
+        write_varint(&mut payload, RESOURCE_PACKS_INFO as u32);
         payload.push(0); // must accept
         payload.push(0); // has addons
         payload.push(0); // has scripts
@@ -1042,10 +1138,13 @@ impl BedrockNetworkServer {
 
     fn send_resource_pack_stack(&self, addr: SocketAddr) {
         let mut payload = Vec::new();
-        payload.push(RESOURCE_PACK_STACK);
+        write_varint(&mut payload, RESOURCE_PACK_STACK as u32);
         payload.push(0); // must accept
         write_varint(&mut payload, 0); // resource pack stack
-        write_varint(&mut payload, pm_core::MINECRAFT_VERSION_NETWORK.len() as u32);
+        write_varint(
+            &mut payload,
+            pm_core::MINECRAFT_VERSION_NETWORK.len() as u32,
+        );
         payload.extend_from_slice(pm_core::MINECRAFT_VERSION_NETWORK.as_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes()); // experiments count
         payload.push(0); // has previously used experiments
@@ -1054,18 +1153,21 @@ impl BedrockNetworkServer {
     }
 
     fn handle_resource_pack_response(&self, addr: SocketAddr, packet: &[u8]) {
-        let mut offset = 1usize;
+        let mut offset = 0usize;
         let status = read_varint(packet, &mut offset).unwrap_or(0);
         let status_text = read_string(packet, &mut offset).unwrap_or_default();
-        self.logger.debug(&format!("Resource pack response from {}: {} ({})", addr, status, status_text));
+        self.logger.debug(&format!(
+            "Resource pack response from {}: {} ({})",
+            addr, status, status_text
+        ));
         match status {
             2 => self.send_resource_pack_stack(addr),
             3 => {
                 self.logger.info(&format!(
-                    "Client {} completed the resource pack stack; StartGame is the next milestone",
+                    "Client {} completed the resource pack stack",
                     addr
                 ));
-                self.send_disconnect(addr, "PocketMine-Rust: StartGame/chunk streaming is the next milestone");
+                self.pending_start_games.lock().unwrap().push(addr);
             }
             0 => {
                 self.send_disconnect(addr, "Resource packs were refused");
@@ -1076,17 +1178,24 @@ impl BedrockNetworkServer {
     }
 
     fn handle_request_chunk_radius(&self, addr: SocketAddr, packet: &[u8]) {
-        let mut offset = 1usize;
+        let mut offset = 0usize;
         let requested = read_varint_signed(packet, &mut offset).unwrap_or(4);
         let radius = requested.clamp(2, 32);
-        self.logger.debug(&format!("Chunk radius request from {}: {} -> {}", addr, requested, radius));
+        self.logger.debug(&format!(
+            "Chunk radius request from {}: {} -> {}",
+            addr, requested, radius
+        ));
+        self.pending_chunk_requests
+            .lock()
+            .unwrap()
+            .push((addr, radius));
         let mut payload = Vec::new();
-        payload.push(CHUNK_RADIUS_UPDATED);
+        write_varint(&mut payload, CHUNK_RADIUS_UPDATED as u32);
         write_varint_signed(&mut payload, radius);
         self.send_packets(addr, vec![payload], None);
 
         let mut time = Vec::new();
-        time.push(SET_TIME);
+        write_varint(&mut time, SET_TIME as u32);
         write_varint_signed(&mut time, 0);
         self.send_packets(addr, vec![time], None);
     }
@@ -1104,7 +1213,8 @@ impl BedrockNetworkServer {
         let shared_secret = match derive_shared_secret(&self.server_key, client_der) {
             Ok(secret) => secret,
             Err(err) => {
-                self.logger.warning(&format!("ECDH with {} failed: {}", addr, err));
+                self.logger
+                    .warning(&format!("ECDH with {} failed: {}", addr, err));
                 return false;
             }
         };
@@ -1113,13 +1223,14 @@ impl BedrockNetworkServer {
         let jwt = match create_handshake_jwt(&self.server_key, &salt) {
             Ok(jwt) => jwt,
             Err(err) => {
-                self.logger.error(&format!("Could not create handshake JWT: {}", err));
+                self.logger
+                    .error(&format!("Could not create handshake JWT: {}", err));
                 return false;
             }
         };
 
-        let mut packet = Vec::with_capacity(jwt.len() + 6);
-        packet.push(SERVER_TO_CLIENT_HANDSHAKE);
+        let mut packet = Vec::with_capacity(jwt.len() + 7);
+        write_varint(&mut packet, SERVER_TO_CLIENT_HANDSHAKE as u32);
         write_varint(&mut packet, jwt.len() as u32);
         packet.extend_from_slice(jwt.as_bytes());
         self.send_packets(addr, vec![packet], None);
@@ -1127,31 +1238,44 @@ impl BedrockNetworkServer {
         let context = match EncryptionContext::new(key) {
             Ok(context) => context,
             Err(err) => {
-                self.logger.error(&format!("Could not enable encryption: {}", err));
+                self.logger
+                    .error(&format!("Could not enable encryption: {}", err));
                 return false;
             }
         };
         {
             let mut sessions = self.sessions.write().unwrap();
-            let Some(session) = sessions.get_mut(&addr) else { return false };
+            let Some(session) = sessions.get_mut(&addr) else {
+                return false;
+            };
             session.encryption = Some(context);
             session.login = Some(identity.clone());
         }
-        self.logger.info(&format!("ServerToClientHandshake sent to {}; encryption enabled", addr));
-        self.pending_logins
-            .lock()
-            .unwrap()
-            .push(PendingLogin { address: addr, identity: identity.clone() });
+        self.logger.info(&format!(
+            "ServerToClientHandshake sent to {}; encryption enabled",
+            addr
+        ));
+        self.pending_logins.lock().unwrap().push(PendingLogin {
+            address: addr,
+            identity: identity.clone(),
+        });
         true
     }
 
     /// Sends game packets as a Bedrock batch, split across RakNet frames when
     /// the payload exceeds the negotiated MTU.
-    pub fn send_packets(&self, addr: SocketAddr, packets: Vec<Vec<u8>>, compress_override: Option<bool>) {
+    pub fn send_packets(
+        &self,
+        addr: SocketAddr,
+        packets: Vec<Vec<u8>>,
+        compress_override: Option<bool>,
+    ) {
         let mut datagrams = Vec::new();
         {
             let mut sessions = self.sessions.write().unwrap();
-            let Some(session) = sessions.get_mut(&addr) else { return };
+            let Some(session) = sessions.get_mut(&addr) else {
+                return;
+            };
 
             let batch = encode_batch(&packets);
             let compress = compress_override.unwrap_or(session.compression_enabled);
@@ -1196,12 +1320,20 @@ impl BedrockNetworkServer {
     }
 
     pub fn disconnect(&self, addr: SocketAddr) {
-        let login = self.sessions.write().unwrap().remove(&addr).and_then(|session| session.login);
+        let login = self
+            .sessions
+            .write()
+            .unwrap()
+            .remove(&addr)
+            .and_then(|session| session.login);
         if let Some(identity) = login {
             self.pending_disconnects
                 .lock()
                 .unwrap()
-                .push(PendingDisconnect { address: addr, name: identity.display_name });
+                .push(PendingDisconnect {
+                    address: addr,
+                    name: identity.display_name,
+                });
         }
     }
 
@@ -1226,21 +1358,27 @@ fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
     if *offset + length > input.len() {
         return None;
     }
-    let text = std::str::from_utf8(&input[*offset..*offset + length]).ok()?.to_string();
+    let text = std::str::from_utf8(&input[*offset..*offset + length])
+        .ok()?
+        .to_string();
     *offset += length;
     Some(text)
 }
 
 fn parse_disconnect(packet: &[u8]) -> Option<(String, String)> {
     // reason varint, then type varint (0 = message), then message string
-    let mut offset = 1usize;
+    let mut offset = 0usize;
     let _reason = read_varint_signed(packet, &mut offset)?;
     let kind = read_varint(packet, &mut offset)?;
     if kind != 0 {
         return None;
     }
     let message = read_string(packet, &mut offset).unwrap_or_default();
-    let name = if message.is_empty() { "client".to_string() } else { message };
+    let name = if message.is_empty() {
+        "client".to_string()
+    } else {
+        message
+    };
     Some((name, String::new()))
 }
 
@@ -1286,11 +1424,11 @@ fn jwt_payload(token: &str) -> Option<Value> {
 /// ECDH public key. Signatures are not verified yet (offline mode); the key is
 /// what the encrypted handshake needs.
 pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
-    if packet.len() < 7 || packet[0] != LOGIN {
+    if packet.len() < 6 {
         return None;
     }
-    let protocol = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
-    let mut offset = 5usize;
+    let protocol = u32::from_be_bytes([packet[0], packet[1], packet[2], packet[3]]);
+    let mut offset = 4usize;
     let request_len = read_varint(packet, &mut offset)? as usize;
     if offset + request_len > packet.len() {
         return None;
@@ -1315,9 +1453,21 @@ pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
     // Protocol >= 1.21.93: {"AuthenticationType":..,"Token":"<jwt>","Certificate":..}
     if let Some(token) = auth_info.get("Token").and_then(Value::as_str) {
         if let Some(claims) = jwt_payload(token) {
-            display_name = claims.get("xname").and_then(Value::as_str).unwrap_or("").to_string();
-            identity = claims.get("leguuid").and_then(Value::as_str).unwrap_or("").to_string();
-            xuid = claims.get("xuid").and_then(Value::as_str).unwrap_or("").to_string();
+            display_name = claims
+                .get("xname")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            identity = claims
+                .get("leguuid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            xuid = claims
+                .get("xuid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             if let Some(cpk) = claims.get("cpk").and_then(Value::as_str) {
                 client_public_key = STANDARD.decode(cpk).ok();
             }
@@ -1327,18 +1477,32 @@ pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
     // Legacy chain format: {"chain":["<jwt>", ...]}
     if let Some(chain) = auth_info.get("chain").and_then(Value::as_array) {
         for token in chain {
-            let Some(token) = token.as_str() else { continue };
+            let Some(token) = token.as_str() else {
+                continue;
+            };
             if let Some(claims) = jwt_payload(token) {
                 if let Some(extra) = claims.get("extraData") {
                     if display_name.is_empty() {
-                        display_name = extra.get("displayName").and_then(Value::as_str).unwrap_or("").to_string();
+                        display_name = extra
+                            .get("displayName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                     }
                     if xuid.is_empty() {
-                        xuid = extra.get("XUID").and_then(Value::as_str).unwrap_or("").to_string();
+                        xuid = extra
+                            .get("XUID")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                     }
                 }
                 if identity.is_empty() {
-                    identity = claims.get("identity").and_then(Value::as_str).unwrap_or("").to_string();
+                    identity = claims
+                        .get("identity")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
                 }
             }
             if client_public_key.is_none() {
@@ -1379,7 +1543,13 @@ pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
     if display_name.is_empty() && identity.is_empty() {
         return None;
     }
-    Some(LoginIdentity { protocol, display_name, identity, xuid, client_public_key })
+    Some(LoginIdentity {
+        protocol,
+        display_name,
+        identity,
+        xuid,
+        client_public_key,
+    })
 }
 
 #[cfg(test)]
@@ -1391,6 +1561,24 @@ mod tests {
     use openssl::ec::{EcGroup, EcKey};
     use openssl::nid::Nid;
     use openssl::pkey::PKey;
+
+    fn packet(id: u32, body: Vec<u8>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(body.len() + 2);
+        write_varint(&mut out, id);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn packet_id(data: &[u8]) -> u32 {
+        let mut offset = 0usize;
+        read_varint(data, &mut offset).unwrap()
+    }
+
+    fn packet_body(data: &[u8]) -> &[u8] {
+        let mut offset = 0usize;
+        read_varint(data, &mut offset).unwrap();
+        &data[offset..]
+    }
 
     fn make_jwt(claims: Value) -> String {
         let header = base64url_encode(b"{\"alg\":\"ES384\"}");
@@ -1421,7 +1609,7 @@ mod tests {
         request.extend_from_slice(&(client_data.len() as u32).to_le_bytes());
         request.extend_from_slice(client_data.as_bytes());
 
-        let mut packet = vec![LOGIN];
+        let mut packet = Vec::new();
         packet.extend_from_slice(&(pm_core::CURRENT_PROTOCOL as u32).to_be_bytes());
         write_varint(&mut packet, request.len() as u32);
         packet.extend_from_slice(&request);
@@ -1528,7 +1716,7 @@ mod tests {
         request.extend_from_slice(chain.as_bytes());
         request.extend_from_slice(&0u32.to_le_bytes());
 
-        let mut packet = vec![LOGIN];
+        let mut packet = Vec::new();
         packet.extend_from_slice(&2225u32.to_be_bytes());
         write_varint(&mut packet, request.len() as u32);
         packet.extend_from_slice(&request);
@@ -1603,15 +1791,26 @@ mod tests {
             }
             let frames = decode_frames(&buf[4..len]);
             assert!(!frames.is_empty());
-            return frames.into_iter().map(|frame| frame.payload).flatten().collect();
+            return frames
+                .into_iter()
+                .map(|frame| frame.payload)
+                .flatten()
+                .collect();
         }
         panic!("no game datagram received");
     }
 
-    fn send_frames(client: &UdpSocket, server: &BedrockNetworkServer, payload: &[u8], sequence: u32) {
+    fn send_frames(
+        client: &UdpSocket,
+        server: &BedrockNetworkServer,
+        payload: &[u8],
+        sequence: u32,
+    ) {
         let frames = split_payload(payload, 1400, 0, 0);
         let datagram = encode_datagram(sequence, &frames);
-        client.send_to(&datagram, server.local_addr().unwrap()).unwrap();
+        client
+            .send_to(&datagram, server.local_addr().unwrap())
+            .unwrap();
         server.process_packets();
     }
 
@@ -1620,24 +1819,49 @@ mod tests {
         let logger = Arc::new(Logger::new("test"));
         let server = BedrockNetworkServer::bind("127.0.0.1:0", "Test", 10, logger).unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
         raknet_handshake(&client, &server);
 
         // 1. RequestNetworkSettings -> uncompressed NetworkSettings batch.
-        send_frames(&client, &server, &encode_batch(&[vec![REQUEST_NETWORK_SETTINGS]]), 1);
+        send_frames(
+            &client,
+            &server,
+            &encode_batch(&[packet(REQUEST_NETWORK_SETTINGS as u32, Vec::new())]),
+            1,
+        );
         let settings_payload = recv_game_payload(&client);
         let packets = decode_batch(&settings_payload).expect("settings batch");
-        assert_eq!(packets[0][0], NETWORK_SETTINGS);
-        assert_eq!(u16::from_le_bytes([packets[0][1], packets[0][2]]), 256);
+        assert_eq!(packet_id(&packets[0]), NETWORK_SETTINGS as u32);
+        let settings_body = packet_body(&packets[0]);
+        assert_eq!(
+            u16::from_le_bytes([settings_body[0], settings_body[1]]),
+            256
+        );
 
         // 2. Compressed Login batch -> compressed PlayStatus rejection.
-        send_frames(&client, &server, &compress_batch(&encode_batch(&[build_login_packet()]), 256), 2);
+        send_frames(
+            &client,
+            &server,
+            &compress_batch(
+                &encode_batch(&[packet(LOGIN as u32, build_login_packet())]),
+                256,
+            ),
+            2,
+        );
         let status_payload = recv_game_payload(&client);
         let batch = decompress_batch(&status_payload).expect("status compression");
         let packets = decode_batch(&batch).expect("status batch");
-        assert_eq!(packets[0][0], PLAY_STATUS);
+        assert_eq!(packet_id(&packets[0]), PLAY_STATUS as u32);
+        let status_body = packet_body(&packets[0]);
         assert_eq!(
-            i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
+            i32::from_be_bytes([
+                status_body[0],
+                status_body[1],
+                status_body[2],
+                status_body[3]
+            ]),
             PLAY_STATUS_LOGIN_FAILED_SERVER_OLD
         );
         assert_eq!(server.stats().logins, 1);
@@ -1654,7 +1878,10 @@ mod tests {
         assert_eq!(identity.display_name, "Steve");
         assert_eq!(identity.identity, "00000000-0000-0000-0000-000000000001");
         assert_eq!(identity.protocol, pm_core::CURRENT_PROTOCOL as u32);
-        assert_eq!(identity.client_public_key.as_deref(), Some(client_der.as_slice()));
+        assert_eq!(
+            identity.client_public_key.as_deref(),
+            Some(client_der.as_slice())
+        );
     }
 
     #[test]
@@ -1662,26 +1889,40 @@ mod tests {
         let logger = Arc::new(Logger::new("test"));
         let server = BedrockNetworkServer::bind("127.0.0.1:0", "Test", 10, logger).unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(800))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .unwrap();
         raknet_handshake(&client, &server);
 
         // NetworkSettings (uncompressed), then Login (compressed, not yet encrypted).
-        send_frames(&client, &server, &encode_batch(&[vec![REQUEST_NETWORK_SETTINGS]]), 1);
+        send_frames(
+            &client,
+            &server,
+            &encode_batch(&[packet(REQUEST_NETWORK_SETTINGS as u32, Vec::new())]),
+            1,
+        );
         let settings = decode_batch(&recv_game_payload(&client)).unwrap();
-        assert_eq!(settings[0][0], NETWORK_SETTINGS);
+        assert_eq!(packet_id(&settings[0]), NETWORK_SETTINGS as u32);
 
         let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
         let client_key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
         let client_der = client_key.public_key_to_der().unwrap();
         let login = build_auth_login(&client_der);
-        send_frames(&client, &server, &compress_batch(&encode_batch(&[login]), 256), 2);
+        send_frames(
+            &client,
+            &server,
+            &compress_batch(&encode_batch(&[packet(LOGIN as u32, login)]), 256),
+            2,
+        );
 
         // ServerToClientHandshake (compressed, unencrypted).
-        let handshake = decode_batch(&decompress_batch(&recv_game_payload(&client)).unwrap()).unwrap();
-        assert_eq!(handshake[0][0], SERVER_TO_CLIENT_HANDSHAKE);
-        let mut offset = 1usize;
-        let jwt_len = read_varint(&handshake[0], &mut offset).unwrap() as usize;
-        let jwt = std::str::from_utf8(&handshake[0][offset..offset + jwt_len]).unwrap();
+        let handshake =
+            decode_batch(&decompress_batch(&recv_game_payload(&client)).unwrap()).unwrap();
+        assert_eq!(packet_id(&handshake[0]), SERVER_TO_CLIENT_HANDSHAKE as u32);
+        let body = packet_body(&handshake[0]);
+        let mut offset = 0usize;
+        let jwt_len = read_varint(body, &mut offset).unwrap() as usize;
+        let jwt = std::str::from_utf8(&body[offset..offset + jwt_len]).unwrap();
         let (server_der, salt) = encryption::parse_handshake_jwt(jwt).expect("handshake JWT");
         assert!(encryption::verify_handshake_jwt(jwt, &server_der));
 
@@ -1696,7 +1937,10 @@ mod tests {
         let key = derive_aes_key(&shared, &salt);
         let mut client_crypto = EncryptionContext::new(key).unwrap();
 
-        let hello = compress_batch(&encode_batch(&[vec![CLIENT_TO_SERVER_HANDSHAKE]]), 256);
+        let hello = compress_batch(
+            &encode_batch(&[packet(CLIENT_TO_SERVER_HANDSHAKE as u32, Vec::new())]),
+            256,
+        );
         let encrypted = client_crypto.encrypt(&hello);
         send_frames(&client, &server, &encrypted, 3);
         assert_eq!(server.stats().encryptions, 1);
@@ -1710,52 +1954,86 @@ mod tests {
 
         // PlayStatus(LoginSuccess) and ResourcePacksInfo.
         let packets = recv_decrypted(&mut client_crypto);
-        assert_eq!(packets[0][0], PLAY_STATUS);
+        assert_eq!(packet_id(&packets[0]), PLAY_STATUS as u32);
+        let status_body = packet_body(&packets[0]);
         assert_eq!(
-            i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
+            i32::from_be_bytes([
+                status_body[0],
+                status_body[1],
+                status_body[2],
+                status_body[3]
+            ]),
             PLAY_STATUS_LOGIN_SUCCESS
         );
         let packs = recv_decrypted(&mut client_crypto);
-        assert_eq!(packs[0][0], RESOURCE_PACKS_INFO);
+        assert_eq!(packet_id(&packs[0]), RESOURCE_PACKS_INFO as u32);
 
         let logins = server.take_logins();
         assert_eq!(logins.len(), 1);
         assert_eq!(logins[0].identity.display_name, "Steve");
         assert_eq!(server.stats().logins, 1);
 
-        let send_client_packet = |crypto: &mut EncryptionContext, packets: Vec<Vec<u8>>, sequence: u32| {
-            let batch = compress_batch(&encode_batch(&packets), 256);
-            let encrypted = crypto.encrypt(&batch);
-            send_frames(&client, &server, &encrypted, sequence);
-        };
+        let send_client_packet =
+            |crypto: &mut EncryptionContext, packets: Vec<Vec<u8>>, sequence: u32| {
+                let batch = compress_batch(&encode_batch(&packets), 256);
+                let encrypted = crypto.encrypt(&batch);
+                send_frames(&client, &server, &encrypted, sequence);
+            };
 
         // Resource packs: HAVE_ALL_PACKS -> ResourcePackStack.
-        let mut response = vec![RESOURCE_PACK_CLIENT_RESPONSE];
-        write_varint(&mut response, 2);
-        write_varint(&mut response, "downloadingfinished".len() as u32);
-        response.extend_from_slice(b"downloadingfinished");
-        send_client_packet(&mut client_crypto, vec![response], 4);
+        let mut response_body = Vec::new();
+        write_varint(&mut response_body, 2);
+        write_varint(&mut response_body, "downloadingfinished".len() as u32);
+        response_body.extend_from_slice(b"downloadingfinished");
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(RESOURCE_PACK_CLIENT_RESPONSE as u32, response_body)],
+            4,
+        );
         let stack = recv_decrypted(&mut client_crypto);
-        assert_eq!(stack[0][0], RESOURCE_PACK_STACK);
+        assert_eq!(packet_id(&stack[0]), RESOURCE_PACK_STACK as u32);
+
+        // COMPLETED -> the server is asked to send StartGame.
+        let mut completed = Vec::new();
+        write_varint(&mut completed, 3);
+        write_varint(&mut completed, "resourcepackstackfinished".len() as u32);
+        completed.extend_from_slice(b"resourcepackstackfinished");
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(RESOURCE_PACK_CLIENT_RESPONSE as u32, completed)],
+            5,
+        );
+        assert_eq!(server.take_start_games().len(), 1);
 
         // Chunk radius -> ChunkRadiusUpdated + SetTime.
-        let mut radius = vec![REQUEST_CHUNK_RADIUS];
-        write_varint_signed(&mut radius, 8);
-        radius.push(8);
-        send_client_packet(&mut client_crypto, vec![radius], 5);
+        let mut radius_body = Vec::new();
+        write_varint_signed(&mut radius_body, 8);
+        radius_body.push(8);
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(REQUEST_CHUNK_RADIUS as u32, radius_body)],
+            6,
+        );
         let updated = recv_decrypted(&mut client_crypto);
-        assert_eq!(updated[0][0], CHUNK_RADIUS_UPDATED);
+        assert_eq!(packet_id(&updated[0]), CHUNK_RADIUS_UPDATED as u32);
         let time = recv_decrypted(&mut client_crypto);
-        assert_eq!(time[0][0], SET_TIME);
+        assert_eq!(packet_id(&time[0]), SET_TIME as u32);
+        let requests = server.take_chunk_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, 8);
 
         // Disconnect is reported to the server loop.
-        let mut bye = vec![DISCONNECT];
-        write_varint_signed(&mut bye, 0);
-        write_varint(&mut bye, 0);
-        write_varint(&mut bye, 3);
-        bye.extend_from_slice(b"bye");
-        write_varint(&mut bye, 0);
-        send_client_packet(&mut client_crypto, vec![bye], 6);
+        let mut bye_body = Vec::new();
+        write_varint_signed(&mut bye_body, 0);
+        write_varint(&mut bye_body, 0);
+        write_varint(&mut bye_body, 3);
+        bye_body.extend_from_slice(b"bye");
+        write_varint(&mut bye_body, 0);
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(DISCONNECT as u32, bye_body)],
+            7,
+        );
         let disconnects = server.take_disconnects();
         assert_eq!(disconnects.len(), 1);
         assert_eq!(disconnects[0].name, "Steve");
@@ -1768,7 +2046,9 @@ mod tests {
         let bind = server.local_addr().unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
         let mut ping = vec![ID_UNCONNECTED_PING];
         ping.extend_from_slice(&123i64.to_be_bytes());
         ping.extend_from_slice(&RAKNET_MAGIC);

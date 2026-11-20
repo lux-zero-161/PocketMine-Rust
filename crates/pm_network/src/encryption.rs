@@ -24,8 +24,12 @@ pub fn generate_server_key() -> Result<PKey<Private>, String> {
 }
 
 /// Derives the 48-byte ECDH shared secret with the client public key (DER/SPKI).
-pub fn derive_shared_secret(server_key: &PKey<Private>, client_public_der: &[u8]) -> Result<Vec<u8>, String> {
-    let peer = PKey::public_key_from_der(client_public_der).map_err(|e| format!("invalid client public key: {e}"))?;
+pub fn derive_shared_secret(
+    server_key: &PKey<Private>,
+    client_public_der: &[u8],
+) -> Result<Vec<u8>, String> {
+    let peer = PKey::public_key_from_der(client_public_der)
+        .map_err(|e| format!("invalid client public key: {e}"))?;
     let mut deriver = openssl::derive::Deriver::new(server_key).map_err(|e| e.to_string())?;
     deriver.set_peer(&peer).map_err(|e| e.to_string())?;
     deriver.derive_to_vec().map_err(|e| e.to_string())
@@ -69,7 +73,8 @@ pub fn create_handshake_jwt(server_key: &PKey<Private>, salt: &[u8]) -> Result<S
     let mut signer = Signer::new(MessageDigest::sha384(), server_key).map_err(|e| e.to_string())?;
     signer.update(body.as_bytes()).map_err(|e| e.to_string())?;
     let der = signer.sign_to_vec().map_err(|e| e.to_string())?;
-    let raw = der_signature_to_raw(&der).ok_or_else(|| "could not convert DER signature".to_string())?;
+    let raw =
+        der_signature_to_raw(&der).ok_or_else(|| "could not convert DER signature".to_string())?;
     Ok(format!("{}.{}", body, URL_SAFE_NO_PAD.encode(raw)))
 }
 
@@ -92,10 +97,18 @@ pub fn verify_handshake_jwt(token: &str, public_der: &[u8]) -> bool {
         return false;
     }
     let body = format!("{}.{}", parts[0], parts[1]);
-    let Ok(raw) = URL_SAFE_NO_PAD.decode(parts[2]) else { return false };
-    let Some(der) = raw_signature_to_der(&raw) else { return false };
-    let Ok(key) = PKey::public_key_from_der(public_der) else { return false };
-    let Ok(mut verifier) = Verifier::new(MessageDigest::sha384(), &key) else { return false };
+    let Ok(raw) = URL_SAFE_NO_PAD.decode(parts[2]) else {
+        return false;
+    };
+    let Some(der) = raw_signature_to_der(&raw) else {
+        return false;
+    };
+    let Ok(key) = PKey::public_key_from_der(public_der) else {
+        return false;
+    };
+    let Ok(mut verifier) = Verifier::new(MessageDigest::sha384(), &key) else {
+        return false;
+    };
     verifier.update(body.as_bytes()).is_ok() && verifier.verify(&der).unwrap_or(false)
 }
 
@@ -112,9 +125,11 @@ impl EncryptionContext {
     pub fn new(key: [u8; 32]) -> Result<Self, String> {
         let iv = &key[0..16];
         let mut encrypt_crypter =
-            Crypter::new(Cipher::aes_256_cfb8(), Mode::Encrypt, &key, Some(iv)).map_err(|e| e.to_string())?;
+            Crypter::new(Cipher::aes_256_cfb8(), Mode::Encrypt, &key, Some(iv))
+                .map_err(|e| e.to_string())?;
         let mut decrypt_crypter =
-            Crypter::new(Cipher::aes_256_cfb8(), Mode::Decrypt, &key, Some(iv)).map_err(|e| e.to_string())?;
+            Crypter::new(Cipher::aes_256_cfb8(), Mode::Decrypt, &key, Some(iv))
+                .map_err(|e| e.to_string())?;
         encrypt_crypter.pad(false);
         decrypt_crypter.pad(false);
         Ok(Self {
@@ -134,7 +149,10 @@ impl EncryptionContext {
         data.extend_from_slice(&checksum);
 
         let mut out = vec![0u8; data.len() + 32];
-        let written = self.encrypt_crypter.update(&data, &mut out).expect("cfb8 encrypt");
+        let written = self
+            .encrypt_crypter
+            .update(&data, &mut out)
+            .expect("cfb8 encrypt");
         out.truncate(written);
         out
     }
@@ -144,7 +162,10 @@ impl EncryptionContext {
             return Err("encrypted payload too short".to_string());
         }
         let mut out = vec![0u8; encrypted.len() + 32];
-        let written = self.decrypt_crypter.update(encrypted, &mut out).map_err(|e| e.to_string())?;
+        let written = self
+            .decrypt_crypter
+            .update(encrypted, &mut out)
+            .map_err(|e| e.to_string())?;
         out.truncate(written);
         if out.len() < 8 {
             return Err("encrypted payload too short".to_string());
@@ -334,7 +355,9 @@ mod tests {
     fn der_and_raw_signature_roundtrip() {
         let server = generate_server_key().unwrap();
         let jwt = create_handshake_jwt(&server, &[1u8; 16]).unwrap();
-        let signature = URL_SAFE_NO_PAD.decode(jwt.split('.').nth(2).unwrap()).unwrap();
+        let signature = URL_SAFE_NO_PAD
+            .decode(jwt.split('.').nth(2).unwrap())
+            .unwrap();
         assert_eq!(signature.len(), 96);
         let der = raw_signature_to_der(&signature).unwrap();
         assert_eq!(der_signature_to_raw(&der).unwrap(), signature);

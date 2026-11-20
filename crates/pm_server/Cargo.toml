@@ -13,6 +13,7 @@ path = "src/main.rs"
 pm_core = { path = "../pm_core" }
 pm_math = { path = "../pm_math" }
 pm_data = { path = "../pm_data" }
+pm_nbt = { path = "../pm_nbt" }
 pm_command = { path = "../pm_command" }
 pm_event = { path = "../pm_event" }
 pm_permission = { path = "../pm_permission" }
@@ -22,3 +23,4 @@ pm_player = { path = "../pm_player" }
 pm_network = { path = "../pm_network" }
 pm_plugin_host = { path = "../pm_plugin_host" }
 serde_json = { workspace = true }
+libc = { workspace = true }

@@ -38,6 +38,8 @@ pub struct ItemType {
 static BLOCK_JSON: &str = include_str!("../data/block_properties_table.json");
 static ITEM_JSON: &str = include_str!("../data/item_registry.json");
 static BLOCK_TO_ITEM_JSON: &str = include_str!("../data/block_id_to_item_id_map.json");
+static ENTITY_IDENTIFIERS_NBT: &[u8] = include_bytes!("../data/entity_identifiers.nbt");
+static JIGSAW_STRUCTURES_NBT: &[u8] = include_bytes!("../data/jigsaw_structures_data.nbt");
 
 static BLOCKS: OnceLock<HashMap<String, BlockProperties>> = OnceLock::new();
 static ITEMS: OnceLock<Vec<ItemType>> = OnceLock::new();
@@ -150,6 +152,16 @@ pub fn item_for_block(block: &str) -> Option<&'static str> {
         serde_json::from_str::<HashMap<String, String>>(BLOCK_TO_ITEM_JSON).unwrap_or_default()
     });
     map.get(block).map(String::as_str)
+}
+
+/// `entity_identifiers.nbt` in Bedrock's network NBT format.
+pub fn entity_identifiers_nbt() -> &'static [u8] {
+    ENTITY_IDENTIFIERS_NBT
+}
+
+/// `jigsaw_structures_data.nbt` in Bedrock's network NBT format.
+pub fn jigsaw_structures_nbt() -> &'static [u8] {
+    JIGSAW_STRUCTURES_NBT
 }
 
 /// Well known vanilla block identifiers.

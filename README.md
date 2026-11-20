@@ -17,9 +17,10 @@ Porting progress, namespace mapping and the milestone plan are in
 ## Status
 
 PocketMine-Rust is a working foundation, not a finished server: the complete
-stack runs (Rust core + in-process C# plugins), but a vanilla client cannot
-join yet because Bedrock login/JWT/encryption are the next milestone.
-LAN discovery and the RakNet handshake already work.
+stack runs (Rust core + in-process C# plugins) and the client path now reaches
+`StartGame` and chunk streaming. It has **not yet been verified against a real
+vanilla client**; that is the immediate next step. LAN discovery, RakNet,
+encrypted login and resource packs already work.
 
 Verified by `./tools/smoke-test.sh`:
 
@@ -45,7 +46,11 @@ Verified by `./tools/smoke-test.sh`:
 | `ResourcePacksInfo` / `ResourcePackStack` + client responses | ✅ |
 | `RequestChunkRadius` → `ChunkRadiusUpdated`, `SetTime` | ✅ |
 | Logged-in clients become real players (join/quit events) | ✅ |
-| `StartGame`, chunk streaming, entities | ⏳ roadmap |
+| `StartGame` (level settings, block palette, full item registry) | ✅ experimental |
+| `LevelChunk` streaming with palette-packed sub-chunks | ✅ experimental |
+| Jigsaw/VoxelShapes/BiomeDefs supporting packets | ✅ minimal |
+| Real vanilla-client verification, entities | ⏳ next |
+| Network NBT writer/reader (`pm_nbt`) | ✅ |
 
 ### Progress by subsystem
 
@@ -65,7 +70,8 @@ gameplay and protocol coverage.
 | Commands | 35 % | map, aliases, permissions, 19 built-ins |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 45 % | ping, batches, split frames, compression, encrypted login, resource packs, chunk radius |
+| Network (RakNet/Bedrock) | 65 % | encrypted login, resource packs, StartGame, chunk streaming |
+| World (chunks, sections, block API) | 45 % | network chunk encoder added, still no LevelDB |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
@@ -73,10 +79,10 @@ gameplay and protocol coverage.
 
 ### Next milestones
 
-1. **M1 Login:** ~~JWT parsing, `ServerToClientHandshake`, AES, compression,
-   resource packs, chunk radius~~ – done. Next: `StartGame`, block/item
-   palettes and chunk streaming. Until then the server disconnects cleanly
-   after the resource pack stack.
+1. **M1 Login:** ~~JWT, handshake, AES, compression, resource packs, chunk
+   radius, StartGame, palettes, chunk streaming~~ – implemented. Next: verify
+   against a real 1.26.60 client and fix protocol details (biome definitions,
+   item component NBT, available commands).
 2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates.
 3. **M3 Gameplay:** entities, physics, damage/death, inventory transactions.
 4. **M4 API parity:** all PMMP events, form API, command parser, selectors.

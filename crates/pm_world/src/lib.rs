@@ -331,6 +331,31 @@ impl Chunk {
             .filter(|s| s.as_ref().is_some_and(|s| !s.is_empty()))
             .count()
     }
+
+    /// Distinct block identifiers used by this chunk (from section palettes).
+    pub fn block_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .sections
+            .iter()
+            .flatten()
+            .flat_map(|section| {
+                section
+                    .palette()
+                    .iter()
+                    .map(|block| block.name().to_string())
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Index of the highest non-empty section, if any.
+    pub fn highest_non_empty_section(&self) -> Option<usize> {
+        self.sections
+            .iter()
+            .rposition(|section| section.as_ref().is_some_and(|s| !s.is_empty()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +530,25 @@ impl World {
 
     pub fn loaded_entity_count(&self) -> usize {
         self.entities.read().unwrap().len()
+    }
+
+    pub fn with_chunk<R>(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        f: impl FnOnce(&Chunk) -> R,
+    ) -> Option<R> {
+        let chunks = self.chunks.read().unwrap();
+        chunks.get(&(chunk_x, chunk_z)).map(f)
+    }
+
+    pub fn loaded_chunk_coords(&self) -> Vec<(i32, i32)> {
+        self.chunks.read().unwrap().keys().copied().collect()
+    }
+
+    pub fn block_names_in_chunk(&self, chunk_x: i32, chunk_z: i32) -> Vec<String> {
+        self.with_chunk(chunk_x, chunk_z, Chunk::block_names)
+            .unwrap_or_default()
     }
 
     pub fn is_chunk_loaded(&self, chunk_x: i32, chunk_z: i32) -> bool {

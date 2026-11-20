@@ -1,5 +1,6 @@
 mod commands;
 mod player_commands;
+mod protocol;
 mod server;
 
 use pm_core::{text, Logger, ServerProperties};

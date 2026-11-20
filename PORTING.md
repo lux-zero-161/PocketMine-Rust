@@ -39,7 +39,12 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | `ResourcePacksInfo` / `ResourcePackStack` + Client-Responses | ✅ | Status 2/3, Stack-Antwort |
 | `RequestChunkRadius` → `ChunkRadiusUpdated`, `SetTime` | ✅ | Radius wird begrenzt |
 | Login → echter Spieler + Join/Quit-Events | ✅ | `process_network_events`, Session-Timeout |
-| `StartGame`, Block-/Item-Paletten, Chunk-Streaming | ⏳ | Client wird nach dem Stack sauber getrennt |
+| `StartGame` + LevelSettings + Block-Palette | ✅ | experimentell, Encoder + Tests |
+| Sende-Pakete: Jigsaw, VoxelShapes, ItemRegistry, BiomeDefs | ✅ | minimal/leer, aber korrekt gerahmt |
+| `LevelChunk`-Streaming mit Paletten-Subchunks | ✅ | eigener Encoder, Chunk-Burst |
+| NBT-Writer/Reader (Bedrock-Netzwerkformat) | ✅ | `pm_nbt`, Palette + Chunkdaten |
+| UDP-Integrationstest Login → StartGame → Chunk | ✅ | echter Socket, Split-Reassembly |
+| Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 
 ---
@@ -56,7 +61,7 @@ Zeilenzahlen aus `../PocketMine-MP/src`. Status: ✅ vorhanden, 🟡 teilweise,
 | `network/` | 111 | 16.237 | `pm_network` | 🟡 RakNet, Batches, Kompression; Login-Verschlüsselung offen |
 | `entity/` | 178 | 14.937 | `pm_world::Entity` | ⏳ nur Basismodell |
 | `item/` | 174 | 14.460 | `pm_player::ItemStack`, `pm_data` | 🟡 Stacks + Registry |
-| `data/` | 101 | 13.210 | `pm_data` | 🟡 bedrock-data, keine Upgrader |
+| `data/` | 101 | 13.210 | `pm_data`, `pm_nbt` | 🟡 bedrock-data + Netzwerk-NBT, keine Upgrader |
 | `event/` | 155 | 9.424 | `pm_event` + C# `PocketMine.Event` | 🟡 16 Kern-Events |
 | `command/` | 57 | 5.254 | `pm_command` + C# `Command` | 🟡 Map/Aliasse, kein Vanilla-Parser |
 | `utils/` | 35 | 5.190 | `pm_core` (Logger, Config, Text) | 🟡 Kern-Utilities |
@@ -137,8 +142,10 @@ Rust nur liest.
 3. ✅ Compression (raw Deflate), Batches, Split-Frames.
 4. ✅ `ResourcePacksInfo`, `ResourcePackStack`, Client-Responses.
 5. ✅ `RequestChunkRadius`, `ChunkRadiusUpdated`, `SetTime`, Session-Timeout.
-6. ⏳ `StartGame`, `BiomeDefinitionList`, `AvailableCommands`, Item-Registry.
-7. ⏳ Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
+6. ✅ `StartGame` + Block-Palette, Item-Registry, Jigsaw/VoxelShapes/BiomeDefs.
+7. ✅ Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
+8. ⏳ Gegen einen echten 1.26.60-Client verifizieren (Biome-Definitionen,
+   Item-Component-NBT, AvailableCommands).
    **Abnahme:** Vanilla-Client 1.26.60 joint, sieht flache Welt, kann laufen.
 
 ### M2 – Welt & Blöcke

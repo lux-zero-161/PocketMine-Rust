@@ -42,7 +42,11 @@ impl Command for GamemodeCommand {
             return false;
         };
         player.set_gamemode(mode);
-        sender.send_message(&format!("§7Set gamemode of §f{}§7 to §f{}", player.name, mode.name()));
+        sender.send_message(&format!(
+            "§7Set gamemode of §f{}§7 to §f{}",
+            player.name,
+            mode.name()
+        ));
         player.send_message(&format!("§7Your gamemode is now §f{}", mode.name()));
         true
     }
@@ -85,21 +89,39 @@ impl Command for GiveCommand {
             return false;
         };
         let item_name = args[1];
-        if pm_data::item_by_name(item_name).is_none() && pm_data::block_properties(item_name).is_none() {
+        if pm_data::item_by_name(item_name).is_none()
+            && pm_data::block_properties(item_name).is_none()
+        {
             sender.send_message(&format!("§cUnknown item '{}'.", item_name));
             return false;
         }
-        let count: u16 = args.get(2).and_then(|c| c.parse().ok()).unwrap_or(1).clamp(1, 64);
+        let count: u16 = args
+            .get(2)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 64);
         let item = ItemStack::new(item_name, count);
         let leftover = {
             let mut inventory = player.inventory_mut();
             inventory.add_item(item.clone())
         };
         if leftover > 0 {
-            sender.send_message(&format!("§eInventory full, {} item(s) were not added.", leftover));
+            sender.send_message(&format!(
+                "§eInventory full, {} item(s) were not added.",
+                leftover
+            ));
         }
-        sender.send_message(&format!("§7Gave §f{}§7 x§f{}§7 to §f{}", item_name, count - leftover, player.name));
-        player.send_message(&format!("§7You received §f{}§7 x§f{}", item_name, count - leftover));
+        sender.send_message(&format!(
+            "§7Gave §f{}§7 x§f{}§7 to §f{}",
+            item_name,
+            count - leftover,
+            player.name
+        ));
+        player.send_message(&format!(
+            "§7You received §f{}§7 x§f{}",
+            item_name,
+            count - leftover
+        ));
         true
     }
 }
@@ -140,12 +162,19 @@ impl Command for TeleportCommand {
             sender.send_message(&format!("§cPlayer '{}' not found.", args[0]));
             return false;
         };
-        let (Ok(x), Ok(y), Ok(z)) = (args[1].parse::<f64>(), args[2].parse::<f64>(), args[3].parse::<f64>()) else {
+        let (Ok(x), Ok(y), Ok(z)) = (
+            args[1].parse::<f64>(),
+            args[2].parse::<f64>(),
+            args[3].parse::<f64>(),
+        ) else {
             sender.send_message("§cCoordinates must be numbers.");
             return false;
         };
         player.set_position(pm_math::Vector3::new(x, y, z));
-        sender.send_message(&format!("§7Teleported §f{}§7 to ({}, {}, {})", player.name, x, y, z));
+        sender.send_message(&format!(
+            "§7Teleported §f{}§7 to ({}, {}, {})",
+            player.name, x, y, z
+        ));
         player.send_message(&format!("§7You were teleported to ({}, {}, {})", x, y, z));
         true
     }

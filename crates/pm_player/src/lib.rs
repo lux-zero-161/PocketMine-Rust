@@ -466,7 +466,9 @@ impl Player {
         let inventory = self.inventory.read().unwrap();
         let mut slots = Vec::new();
         for slot in 0..inventory.size() {
-            let Some(entry) = inventory.get(slot) else { continue };
+            let Some(entry) = inventory.get(slot) else {
+                continue;
+            };
             if entry.is_empty() {
                 continue;
             }
@@ -629,7 +631,9 @@ mod json_tests {
     #[test]
     fn inventory_serialises() {
         let player = Player::new("Json", "uuid", Vector3::ZERO, "world");
-        let leftover = player.inventory_mut().add_item(ItemStack::new("minecraft:diamond", 5));
+        let leftover = player
+            .inventory_mut()
+            .add_item(ItemStack::new("minecraft:diamond", 5));
         assert_eq!(leftover, 0);
         let value = player.to_json();
         println!("{}", serde_json::to_string_pretty(&value).unwrap());

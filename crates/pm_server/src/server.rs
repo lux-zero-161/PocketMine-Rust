@@ -34,6 +34,8 @@ pub struct ServerState {
     pub worlds_path: RwLock<String>,
     /// Connected player name (lowercase) -> UDP session address.
     pub player_sessions: RwLock<HashMap<String, SocketAddr>>,
+    /// UDP session address -> player name.
+    pub session_players: RwLock<HashMap<SocketAddr, String>>,
 }
 
 impl ServerState {
@@ -57,6 +59,7 @@ impl ServerState {
             network: Mutex::new(None),
             worlds_path: RwLock::new(pm_core::WORLD_DIRECTORY.to_string()),
             player_sessions: RwLock::new(HashMap::new()),
+            session_players: RwLock::new(HashMap::new()),
         })
     }
 
@@ -236,7 +239,10 @@ impl ServerState {
 
                 if let Some(existing) = self.players.get(&name) {
                     existing.set_online(false);
-                    self.player_sessions.write().unwrap().remove(&name.to_ascii_lowercase());
+                    self.player_sessions
+                        .write()
+                        .unwrap()
+                        .remove(&name.to_ascii_lowercase());
                 }
 
                 let world = self.default_world();
@@ -244,7 +250,12 @@ impl ServerState {
                     .as_ref()
                     .map(|world| world.spawn_position())
                     .unwrap_or_else(|| pm_math::Vector3::new(0.0, 5.0, 0.0));
-                let mut player = Player::new(name.clone(), uuid.clone(), spawn, self.props.level_name.clone());
+                let mut player = Player::new(
+                    name.clone(),
+                    uuid.clone(),
+                    spawn,
+                    self.props.level_name.clone(),
+                );
                 player.entity_id = self.tick_now() + 1;
                 player.address = login.address.ip().to_string();
                 player.port = login.address.port();
@@ -255,13 +266,18 @@ impl ServerState {
                     .write()
                     .unwrap()
                     .insert(name.to_ascii_lowercase(), login.address);
+                self.session_players
+                    .write()
+                    .unwrap()
+                    .insert(login.address, name.clone());
 
                 if let Some(world) = world.as_ref() {
                     // Bounded preload; proper view-distance streaming comes with StartGame.
                     world.load_chunks_around(spawn, self.props.view_distance.min(4) as i32);
                 }
 
-                let mut event = PlayerJoinEvent::new(player.name.clone(), player.uuid.clone(), String::new());
+                let mut event =
+                    PlayerJoinEvent::new(player.name.clone(), player.uuid.clone(), String::new());
                 self.dispatch(&mut event);
                 let message = if event.join_message.is_empty() {
                     format!("§e{} joined the game", player.name)
@@ -281,8 +297,16 @@ impl ServerState {
                     .write()
                     .unwrap()
                     .remove(&disconnect.name.to_ascii_lowercase());
+                self.session_players
+                    .write()
+                    .unwrap()
+                    .remove(&disconnect.address);
                 if let Some(player) = self.players.get(&disconnect.name) {
-                    let mut event = PlayerQuitEvent::new(player.name.clone(), player.uuid.clone(), String::new());
+                    let mut event = PlayerQuitEvent::new(
+                        player.name.clone(),
+                        player.uuid.clone(),
+                        String::new(),
+                    );
                     self.dispatch(&mut event);
                     let message = if event.quit_message.is_empty() {
                         format!("§e{} left the game", player.name)
@@ -293,7 +317,73 @@ impl ServerState {
                 }
                 self.players.remove(&disconnect.name);
             }
+
+            for address in network.take_start_games() {
+                self.start_game_for(address);
+            }
+            for (address, radius) in network.take_chunk_requests() {
+                self.send_chunks_for(address, radius);
+            }
         }
+    }
+
+    /// Sends the pre-spawn packet set and the initial chunk burst.
+    fn start_game_for(&self, address: SocketAddr) {
+        let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
+            return;
+        };
+        let Some(player) = self.players.get(&name) else {
+            return;
+        };
+        let Some(world) = self.default_world() else {
+            return;
+        };
+
+        let palette = crate::protocol::BlockPalette::build(&world);
+        let packets = crate::protocol::pre_spawn_packets(
+            &player,
+            &world,
+            self.tick_now(),
+            &self.props.motd,
+            &palette,
+        );
+        if let Some(network) = self.network.lock().unwrap().clone() {
+            network.send_packets(address, packets, None);
+        }
+        self.logger.info(&format!(
+            "Sent StartGame to {} ({} block states in palette)",
+            player.name,
+            palette.len()
+        ));
+        self.send_chunks_for(address, 2);
+    }
+
+    /// Sends `LevelChunk` packets around the player's current position.
+    fn send_chunks_for(&self, address: SocketAddr, radius: i32) {
+        let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
+            return;
+        };
+        let Some(player) = self.players.get(&name) else {
+            return;
+        };
+        let Some(world) = self.default_world() else {
+            return;
+        };
+
+        let radius = radius.clamp(2, 8);
+        let palette = crate::protocol::BlockPalette::build(&world);
+        let chunks =
+            crate::protocol::chunk_burst(&world, player.position().floor(), radius, &palette);
+        let packet_count = chunks.len();
+        if let Some(network) = self.network.lock().unwrap().clone() {
+            for chunk in chunks {
+                network.send_packets(address, vec![chunk], None);
+            }
+        }
+        self.logger.info(&format!(
+            "Sent {} chunk(s) to {} (radius {})",
+            packet_count, player.name, radius
+        ));
     }
 
     pub fn server_info(&self) -> serde_json::Value {
@@ -454,5 +544,149 @@ impl ServerBridge for ServerState {
 
     fn shutdown(&self) {
         ServerState::shutdown(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pm_network::{decode_frames, SplitAssembly};
+    use pm_player::Player;
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    fn raknet_client(server: &pm_network::BedrockNetworkServer) -> (UdpSocket, SocketAddr) {
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let session_addr = client.local_addr().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let size: libc::c_int = 8 * 1024 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    client.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+        let addr = server.local_addr().unwrap();
+        let mut buf = [0u8; 4096];
+
+        let mut request = vec![0x05];
+        request.extend_from_slice(&pm_core::RAKNET_MAGIC);
+        request.push(11);
+        request.extend_from_slice(&[0u8; 1300]);
+        client.send_to(&request, addr).unwrap();
+        server.process_packets();
+        let (len, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0x06);
+        let mtu = u16::from_be_bytes([buf[len - 2], buf[len - 1]]);
+
+        let mut request = vec![0x07];
+        request.extend_from_slice(&pm_core::RAKNET_MAGIC);
+        request.extend_from_slice(&[4, 127, 0, 0, 1, 0x4f, 0x9f]);
+        request.extend_from_slice(&mtu.to_be_bytes());
+        request.extend_from_slice(&7i64.to_be_bytes());
+        client.send_to(&request, addr).unwrap();
+        server.process_packets();
+        let (_, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0x08);
+        (client, session_addr)
+    }
+
+    fn recv_batch(client: &UdpSocket) -> Vec<Vec<u8>> {
+        let mut assemblies: HashMap<u16, SplitAssembly> = HashMap::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let (len, _) = client.recv_from(&mut buf).unwrap();
+            if buf[0] != 0x84 {
+                continue;
+            }
+            for frame in decode_frames(&buf[4..len]) {
+                let payload = if frame.is_split() {
+                    let assembly = assemblies
+                        .entry(frame.split_id)
+                        .or_insert_with(|| SplitAssembly::new(frame.split_count));
+                    let result = assembly.push(frame.split_index, frame.payload);
+                    if result.is_some() {
+                        assemblies.remove(&frame.split_id);
+                    }
+                    result
+                } else {
+                    Some(frame.payload)
+                };
+                if let Some(payload) = payload {
+                    return pm_network::decode_batch(&payload).expect("batch");
+                }
+            }
+        }
+    }
+
+    fn packet_id(packet: &[u8]) -> u32 {
+        let mut offset = 0usize;
+        pm_network::read_varint(packet, &mut offset).unwrap()
+    }
+
+    #[test]
+    fn start_game_and_chunks_are_sent_to_the_session() {
+        let logger = Arc::new(Logger::new("test"));
+        let props = Arc::new(pm_core::ServerProperties::default());
+        let state = ServerState::new(logger, props);
+        state.prepare_default_world();
+
+        let network = Arc::new(
+            pm_network::BedrockNetworkServer::bind("127.0.0.1:0", "Test", 10, state.logger.clone())
+                .unwrap(),
+        );
+        *state.network.lock().unwrap() = Some(network.clone());
+
+        let (client, addr) = raknet_client(&network);
+        let world = state.default_world().unwrap();
+        let player = Arc::new(Player::new(
+            "Steve",
+            "uuid",
+            world.spawn_position(),
+            world.name.clone(),
+        ));
+        state.players.add(player.clone());
+        state
+            .session_players
+            .write()
+            .unwrap()
+            .insert(addr, "Steve".to_string());
+
+        state.start_game_for(addr);
+
+        let pre_spawn = recv_batch(&client);
+        assert_eq!(
+            packet_id(&pre_spawn[0]),
+            crate::protocol::JIGSAW_STRUCTURE_DATA_PACKET
+        );
+        assert_eq!(
+            packet_id(&pre_spawn[1]),
+            crate::protocol::VOXEL_SHAPES_PACKET
+        );
+        assert_eq!(packet_id(&pre_spawn[2]), crate::protocol::START_GAME_PACKET);
+        assert_eq!(
+            packet_id(&pre_spawn[3]),
+            crate::protocol::ITEM_REGISTRY_PACKET
+        );
+        assert_eq!(
+            packet_id(&pre_spawn[4]),
+            crate::protocol::AVAILABLE_ACTOR_IDENTIFIERS_PACKET
+        );
+        assert_eq!(
+            packet_id(&pre_spawn[5]),
+            crate::protocol::BIOME_DEFINITION_LIST_PACKET
+        );
+
+        let chunk = recv_batch(&client);
+        assert_eq!(packet_id(&chunk[0]), crate::protocol::LEVEL_CHUNK_PACKET);
     }
 }

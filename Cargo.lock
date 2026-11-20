@@ -184,6 +184,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm_nbt"
+version = "1.0.0"
+
+[[package]]
 name = "pm_network"
 version = "1.0.0"
 dependencies = [
@@ -235,11 +239,13 @@ version = "1.0.0"
 name = "pm_server"
 version = "1.0.0"
 dependencies = [
+ "libc",
  "pm_command",
  "pm_core",
  "pm_data",
  "pm_event",
  "pm_math",
+ "pm_nbt",
  "pm_network",
  "pm_permission",
  "pm_player",
