@@ -166,11 +166,6 @@ impl ServerState {
             world.loaded_chunk_count(),
             world.seed
         ));
-        let _ = world.save(std::path::Path::new(&format!(
-            "{}/{}",
-            pm_core::WORLD_DIRECTORY,
-            name
-        )));
     }
 
     /// Creates a fake player for testing events/commands without a client.
