@@ -84,6 +84,13 @@ impl Block {
         self.name() == pm_data::blocks::AIR
     }
 
+    pub fn is_replaceable(&self) -> bool {
+        matches!(
+            self.name(),
+            pm_data::blocks::AIR | pm_data::blocks::WATER | pm_data::blocks::LAVA
+        )
+    }
+
     pub fn is_solid(&self) -> bool {
         !self.is_air()
             && self.name() != pm_data::blocks::WATER

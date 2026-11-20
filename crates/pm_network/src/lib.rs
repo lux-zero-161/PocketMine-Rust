@@ -41,6 +41,9 @@ pub mod protocol {
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u8 = 0x08;
     pub const TEXT: u8 = 0x09;
     pub const COMMAND_REQUEST: u8 = 0x4d;
+    pub const UPDATE_BLOCK: u8 = 0x15;
+    pub const PLAYER_ACTION: u8 = 0x24;
+    pub const INVENTORY_TRANSACTION: u8 = 0x1e;
     pub const SET_TIME: u8 = 0x0a;
     pub const START_GAME: u8 = 0x0b;
     pub const ADD_PLAYER: u8 = 0x0c;
@@ -120,6 +123,23 @@ fn write_address(buf: &mut Vec<u8>, addr: SocketAddr) {
 
 fn read_magic(buf: &[u8], offset: usize) -> bool {
     buf.len() >= offset + 16 && &buf[offset..offset + 16] == RAKNET_MAGIC
+}
+
+pub fn read_varlong(input: &[u8], offset: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let byte = *input.get(*offset)?;
+        *offset += 1;
+        value |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift >= 70 {
+            return None;
+        }
+    }
 }
 
 pub fn write_varint(out: &mut Vec<u8>, mut value: u32) {
@@ -584,6 +604,29 @@ pub struct LoginIdentity {
     pub client_public_key: Option<Vec<u8>>,
 }
 
+/// Block placement request from `InventoryTransactionPacket` (use item on block).
+#[derive(Debug, Clone, Copy)]
+pub struct PendingBlockPlace {
+    pub address: SocketAddr,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub face: u8,
+    pub item_id: i32,
+    pub item_count: u16,
+}
+
+/// Block action received from a client (`PlayerActionPacket`).
+#[derive(Debug, Clone, Copy)]
+pub struct PendingBlockAction {
+    pub address: SocketAddr,
+    pub action: i32,
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    pub face: i32,
+}
+
 /// A client that completed the encrypted login handshake.
 #[derive(Debug, Clone)]
 pub struct PendingLogin {
@@ -632,6 +675,8 @@ pub struct BedrockNetworkServer {
     pending_chunk_requests: std::sync::Mutex<Vec<(SocketAddr, i32)>>,
     pending_chats: std::sync::Mutex<Vec<(SocketAddr, String)>>,
     pending_commands: std::sync::Mutex<Vec<(SocketAddr, String)>>,
+    pending_block_actions: std::sync::Mutex<Vec<PendingBlockAction>>,
+    pending_block_places: std::sync::Mutex<Vec<PendingBlockPlace>>,
 }
 
 impl BedrockNetworkServer {
@@ -692,6 +737,8 @@ impl BedrockNetworkServer {
             pending_chunk_requests: std::sync::Mutex::new(Vec::new()),
             pending_chats: std::sync::Mutex::new(Vec::new()),
             pending_commands: std::sync::Mutex::new(Vec::new()),
+            pending_block_actions: std::sync::Mutex::new(Vec::new()),
+            pending_block_places: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -748,6 +795,18 @@ impl BedrockNetworkServer {
     /// Commands requested by clients (without the leading slash).
     pub fn take_commands(&self) -> Vec<(SocketAddr, String)> {
         let mut guard = self.pending_commands.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Block actions (break/continue/creative destroy) from clients.
+    pub fn take_block_actions(&self) -> Vec<PendingBlockAction> {
+        let mut guard = self.pending_block_actions.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Block placement requests from clients.
+    pub fn take_block_places(&self) -> Vec<PendingBlockPlace> {
+        let mut guard = self.pending_block_places.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
@@ -1091,6 +1150,16 @@ impl BedrockNetworkServer {
                     self.pending_commands.lock().unwrap().push((addr, command));
                 }
             }
+            PLAYER_ACTION => {
+                if let Some(action) = parse_player_action(addr, body) {
+                    self.pending_block_actions.lock().unwrap().push(action);
+                }
+            }
+            INVENTORY_TRANSACTION => {
+                if let Some(place) = parse_place_transaction(addr, body) {
+                    self.pending_block_places.lock().unwrap().push(place);
+                }
+            }
             RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, body),
             REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, body),
             DISCONNECT => {
@@ -1393,6 +1462,84 @@ fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
     Some(text)
 }
 
+/// Parses the leading fields of `InventoryTransactionPacket` for use-item-on-block.
+pub fn parse_place_transaction(address: SocketAddr, body: &[u8]) -> Option<PendingBlockPlace> {
+    let mut offset = 0usize;
+    let _request_id = read_varint_signed(body, &mut offset)?;
+    let changed_slots = *body.get(offset)?;
+    offset += 1;
+    if changed_slots != 0 {
+        // Optional change-slot list is rare and not needed for placement.
+        return None;
+    }
+    let transaction_type = read_varint(body, &mut offset)?;
+    if transaction_type != 2 {
+        return None;
+    }
+    let action = read_varint_signed(body, &mut offset)?;
+    if !matches!(action, 0 | 2) {
+        return None;
+    }
+    let _trigger = *body.get(offset)?;
+    offset += 1;
+    let x = read_varint_signed(body, &mut offset)?;
+    let y = read_varint_signed(body, &mut offset)?;
+    let z = read_varint_signed(body, &mut offset)?;
+    let face = *body.get(offset)?;
+    offset += 1;
+
+    // hotbar slot, hand slot, then the network item-stack descriptor
+    let _hotbar_slot = read_varint_signed(body, &mut offset)?;
+    let _hand = *body.get(offset)?;
+    offset += 1;
+    let id_bytes = body.get(offset..offset + 2)?;
+    let item_id = i16::from_le_bytes([id_bytes[0], id_bytes[1]]) as i32;
+    offset += 2;
+    let count_bytes = body.get(offset..offset + 2)?;
+    let item_count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]);
+    offset += 2;
+    let _meta = read_varint(body, &mut offset)?;
+    let has_net_id = *body.get(offset)?;
+    offset += 1;
+    if has_net_id != 0 {
+        let _stack_id = read_varint_signed(body, &mut offset)?;
+    }
+    let _block_runtime_id = read_varint(body, &mut offset)?;
+    let _extra = read_string(body, &mut offset)?;
+
+    Some(PendingBlockPlace {
+        address,
+        x,
+        y,
+        z,
+        face,
+        item_id,
+        item_count,
+    })
+}
+
+/// Parses `PlayerActionPacket` (break/creative destroy/continue).
+pub fn parse_player_action(address: SocketAddr, body: &[u8]) -> Option<PendingBlockAction> {
+    let mut offset = 0usize;
+    let _runtime_id = read_varlong(body, &mut offset)?;
+    let action = read_varint_signed(body, &mut offset)?;
+    let x = read_varint_signed(body, &mut offset)?;
+    let y = read_varint_signed(body, &mut offset)?;
+    let z = read_varint_signed(body, &mut offset)?;
+    let _result_x = read_varint_signed(body, &mut offset)?;
+    let _result_y = read_varint_signed(body, &mut offset)?;
+    let _result_z = read_varint_signed(body, &mut offset)?;
+    let face = read_varint_signed(body, &mut offset)?;
+    Some(PendingBlockAction {
+        address,
+        action,
+        x,
+        y,
+        z,
+        face,
+    })
+}
+
 /// Parses an incoming Text packet and returns the chat/raw message.
 pub fn parse_text(packet: &[u8]) -> Option<String> {
     let mut offset = 0usize;
@@ -1608,6 +1755,17 @@ mod tests {
     fn test_string(out: &mut Vec<u8>, value: &str) {
         write_varint(out, value.len() as u32);
         out.extend_from_slice(value.as_bytes());
+    }
+
+    fn test_varlong(out: &mut Vec<u8>, mut value: u64) {
+        loop {
+            if value & !0x7f == 0 {
+                out.push(value as u8);
+                return;
+            }
+            out.push(((value & 0x7f) | 0x80) as u8);
+            value >>= 7;
+        }
     }
 
     fn packet(id: u32, body: Vec<u8>) -> Vec<u8> {
@@ -2089,6 +2247,54 @@ mod tests {
         let commands = server.take_commands();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].1, "help");
+
+        let mut action = Vec::new();
+        test_varlong(&mut action, 1);
+        write_varint_signed(&mut action, 13); // creative destroy
+        for value in [0, 4, 0, 0, 4, 0] {
+            write_varint_signed(&mut action, value);
+        }
+        write_varint_signed(&mut action, 1); // face
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(PLAYER_ACTION as u32, action)],
+            8,
+        );
+        let actions = server.take_block_actions();
+        assert_eq!(actions.len(), 1);
+        assert_eq!((actions[0].x, actions[0].y, actions[0].z), (0, 4, 0));
+        assert_eq!(actions[0].action, 13);
+
+        let mut place = Vec::new();
+        write_varint_signed(&mut place, 0); // request id
+        place.push(0); // no changed slots
+        write_varint(&mut place, 2); // use item
+        write_varint_signed(&mut place, 0); // click block
+        place.push(0); // trigger
+        for value in [5, 4, 5] {
+            write_varint_signed(&mut place, value);
+        }
+        place.push(1); // face up
+        write_varint_signed(&mut place, 0); // hotbar slot
+        place.push(0); // hand slot
+        place.extend_from_slice(&1i16.to_le_bytes()); // stone item id
+        place.extend_from_slice(&1u16.to_le_bytes()); // count
+        write_varint(&mut place, 0); // meta
+        place.push(0); // no net id
+        write_varint(&mut place, 0); // block runtime id
+        test_string(&mut place, ""); // extra data
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(INVENTORY_TRANSACTION as u32, place)],
+            9,
+        );
+        let places = server.take_block_places();
+        assert_eq!(places.len(), 1);
+        assert_eq!(
+            (places[0].x, places[0].y, places[0].z, places[0].face),
+            (5, 4, 5, 1)
+        );
+        assert_eq!((places[0].item_id, places[0].item_count), (1, 1));
 
         // Disconnect is reported to the server loop.
         let mut bye_body = Vec::new();

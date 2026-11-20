@@ -36,6 +36,8 @@ pub struct ServerState {
     pub player_sessions: RwLock<HashMap<String, SocketAddr>>,
     /// UDP session address -> player name.
     pub session_players: RwLock<HashMap<SocketAddr, String>>,
+    /// Per-player block palette, kept stable for the whole session.
+    palettes: RwLock<HashMap<String, Arc<crate::protocol::BlockPalette>>>,
 }
 
 impl ServerState {
@@ -60,6 +62,7 @@ impl ServerState {
             worlds_path: RwLock::new(pm_core::WORLD_DIRECTORY.to_string()),
             player_sessions: RwLock::new(HashMap::new()),
             session_players: RwLock::new(HashMap::new()),
+            palettes: RwLock::new(HashMap::new()),
         })
     }
 
@@ -347,6 +350,13 @@ impl ServerState {
                 self.send_chunks_for(address, radius);
             }
 
+            for action in network.take_block_actions() {
+                self.handle_block_action(action);
+            }
+            for place in network.take_block_places() {
+                self.handle_block_place(place);
+            }
+
             for (address, message) in network.take_chats() {
                 let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
                     continue;
@@ -405,7 +415,11 @@ impl ServerState {
             return;
         };
 
-        let palette = crate::protocol::BlockPalette::build(&world);
+        let palette = Arc::new(crate::protocol::BlockPalette::build(&world));
+        self.palettes
+            .write()
+            .unwrap()
+            .insert(player.name.to_ascii_lowercase(), palette.clone());
         let packets = crate::protocol::pre_spawn_packets(
             &player,
             &world,
@@ -426,6 +440,170 @@ impl ServerState {
             network.send_packets(
                 address,
                 crate::protocol::spawn_packets(&player, &world, self.tick_now()),
+                None,
+            );
+        }
+    }
+
+    fn palette_for(&self, player_name: &str, world: &World) -> Arc<crate::protocol::BlockPalette> {
+        if let Some(palette) = self
+            .palettes
+            .read()
+            .unwrap()
+            .get(&player_name.to_ascii_lowercase())
+            .cloned()
+        {
+            return palette;
+        }
+        let palette = Arc::new(crate::protocol::BlockPalette::build(world));
+        self.palettes
+            .write()
+            .unwrap()
+            .insert(player_name.to_ascii_lowercase(), palette.clone());
+        palette
+    }
+
+    fn handle_block_action(&self, action: pm_network::PendingBlockAction) {
+        const STOP_BREAK: i32 = 2;
+        const CREATIVE_DESTROY: i32 = 13;
+        const PREDICT_DESTROY: i32 = 26;
+        if !matches!(
+            action.action,
+            STOP_BREAK | CREATIVE_DESTROY | PREDICT_DESTROY
+        ) {
+            return;
+        }
+        let Some(name) = self
+            .session_players
+            .read()
+            .unwrap()
+            .get(&action.address)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(player) = self.players.get(&name) else {
+            return;
+        };
+        let Some(world) = self.default_world() else {
+            return;
+        };
+
+        let position = pm_math::BlockPosition::new(action.x, action.y, action.z);
+        let block = world.get_block(&position);
+        if block.is_air() {
+            return;
+        }
+        let mut event = pm_event::BlockBreakEvent::new(
+            player.name.clone(),
+            position,
+            block.id as u32,
+            block.name().to_string(),
+        );
+        if self.dispatch(&mut event) {
+            // Cancel: restore the block for every client.
+            self.broadcast_block_update(&position, block);
+            return;
+        }
+        world.set_block(&position, pm_world::Block::air());
+        self.broadcast_block_update(&position, pm_world::Block::air());
+        self.logger.info(&format!(
+            "{} broke {} at {}",
+            player.name,
+            block.name(),
+            position
+        ));
+    }
+
+    fn handle_block_place(&self, place: pm_network::PendingBlockPlace) {
+        let Some(name) = self
+            .session_players
+            .read()
+            .unwrap()
+            .get(&place.address)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(player) = self.players.get(&name) else {
+            return;
+        };
+        let Some(world) = self.default_world() else {
+            return;
+        };
+
+        let held = player.inventory().held_item().clone();
+        let block_name = if place.item_id > 0 {
+            pm_data::item_by_id(place.item_id)
+                .map(|item| item.string_id.clone())
+                .unwrap_or_else(|| held.name.clone())
+        } else {
+            held.name.clone()
+        };
+        let Some(block) = pm_world::Block::from_name(&block_name) else {
+            return;
+        };
+        if block.is_air() {
+            return;
+        }
+
+        let clicked = pm_math::BlockPosition::new(place.x, place.y, place.z);
+        let target = if world.get_block(&clicked).is_replaceable() {
+            clicked
+        } else {
+            let facing = match place.face {
+                0 => pm_math::Facing::Down,
+                1 => pm_math::Facing::Up,
+                2 => pm_math::Facing::North,
+                3 => pm_math::Facing::South,
+                4 => pm_math::Facing::West,
+                _ => pm_math::Facing::East,
+            };
+            clicked.side(facing)
+        };
+        if !world.get_block(&target).is_replaceable() {
+            return;
+        }
+
+        let mut event = pm_event::BlockPlaceEvent::new(
+            player.name.clone(),
+            target,
+            block.id as u32,
+            block.name().to_string(),
+        );
+        if self.dispatch(&mut event) {
+            self.broadcast_block_update(&target, world.get_block(&target));
+            return;
+        }
+
+        world.set_block(&target, block);
+        self.broadcast_block_update(&target, block);
+        self.logger.info(&format!(
+            "{} placed {} at {}",
+            player.name,
+            block.name(),
+            target
+        ));
+    }
+
+    fn broadcast_block_update(&self, position: &pm_math::BlockPosition, block: pm_world::Block) {
+        let network = self.network.lock().unwrap().clone();
+        let Some(network) = network else { return };
+        let Some(world) = self.default_world() else {
+            return;
+        };
+        let sessions = self.player_sessions.read().unwrap().clone();
+        for player in self.players.online() {
+            let Some(address) = sessions.get(&player.name.to_ascii_lowercase()) else {
+                continue;
+            };
+            let palette = self.palette_for(&player.name, &world);
+            let runtime_id = palette.id(&block);
+            network.send_packets(
+                *address,
+                vec![crate::protocol::update_block_packet(
+                    *position, runtime_id, 3, 0,
+                )],
                 None,
             );
         }
@@ -761,5 +939,62 @@ mod tests {
 
         let chunk = recv_batch(&client);
         assert_eq!(packet_id(&chunk[0]), crate::protocol::LEVEL_CHUNK_PACKET);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+    use pm_network::{PendingBlockAction, PendingBlockPlace};
+    use pm_player::{ItemStack, Player};
+    use pm_world::blocks;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn breaks_and_places_blocks_in_the_world() {
+        let logger = Arc::new(Logger::new("test"));
+        let state = ServerState::new(logger, Arc::new(pm_core::ServerProperties::default()));
+        state.prepare_default_world();
+        let world = state.default_world().unwrap();
+
+        let address = SocketAddr::from((Ipv4Addr::LOCALHOST, 4242));
+        let player = Arc::new(Player::new(
+            "Steve",
+            "uuid",
+            pm_math::Vector3::new(0.5, 5.0, 0.5),
+            world.name.clone(),
+        ));
+        player
+            .inventory_mut()
+            .set(0, ItemStack::new("minecraft:stone", 1));
+        state.players.add(player);
+        state
+            .session_players
+            .write()
+            .unwrap()
+            .insert(address, "Steve".to_string());
+
+        world.set_block_at(0, 3, 0, blocks::grass());
+        state.handle_block_action(PendingBlockAction {
+            address,
+            action: 13,
+            x: 0,
+            y: 3,
+            z: 0,
+            face: 1,
+        });
+        assert!(world.get_block_at(0, 3, 0).is_air());
+        assert_eq!(world.get_block_at(0, 2, 0).name(), "minecraft:dirt");
+
+        state.handle_block_place(PendingBlockPlace {
+            address,
+            x: 0,
+            y: 2,
+            z: 0,
+            face: 1,
+            item_id: 1,
+            item_count: 1,
+        });
+        assert_eq!(world.get_block_at(0, 3, 0).name(), "minecraft:stone");
     }
 }

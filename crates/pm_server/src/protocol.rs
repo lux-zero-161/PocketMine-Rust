@@ -20,6 +20,7 @@ pub const JIGSAW_STRUCTURE_DATA_PACKET: u32 = 0x139;
 pub const VOXEL_SHAPES_PACKET: u32 = 0x151;
 pub const PLAY_STATUS_PACKET: u32 = 0x02;
 pub const TEXT_PACKET: u32 = 0x09;
+pub const UPDATE_BLOCK_PACKET: u32 = 0x15;
 pub const MOVE_PLAYER_PACKET: u32 = 0x13;
 pub const SET_SPAWN_POSITION_PACKET: u32 = 0x2b;
 pub const SET_DIFFICULTY_PACKET: u32 = 0x3c;
@@ -481,6 +482,20 @@ pub fn spawn_packets(player: &Player, world: &World, tick: u64) -> Vec<Vec<u8>> 
         play_status_packet(PLAY_STATUS_PLAYER_SPAWN),
         set_time_packet(world.time()),
     ]
+}
+
+pub fn update_block_packet(
+    position: BlockPosition,
+    runtime_id: i32,
+    flags: u32,
+    layer: u32,
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(16);
+    put_block_position(&mut body, position);
+    write_varint(&mut body, runtime_id.max(0) as u32);
+    write_varint(&mut body, flags);
+    write_varint(&mut body, layer);
+    packet(UPDATE_BLOCK_PACKET, body)
 }
 
 pub fn text_packet(message: &str, source: Option<&str>) -> Vec<u8> {

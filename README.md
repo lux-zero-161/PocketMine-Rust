@@ -51,6 +51,7 @@ Verified by `./tools/smoke-test.sh`:
 | Jigsaw/VoxelShapes/BiomeDefs/Commands/Abilities packets | ✅ |
 | Spawn sequence: `MovePlayer`, `SetSpawnPosition`, `PLAYER_SPAWN` | ✅ |
 | Client chat (`Text`) and commands (`CommandRequest`) | ✅ |
+| Block break/place (`PlayerAction`, `InventoryTransaction`) + `UpdateBlock` | ✅ |
 | Server/plugin messages as `Text` packets | ✅ |
 | Real vanilla-client verification, entities | ⏳ next |
 | Network NBT writer/reader (`pm_nbt`) | ✅ |
@@ -71,10 +72,10 @@ gameplay and protocol coverage.
 | World (chunks, sections, block API) | 30 % | flat generator, no LevelDB yet |
 | Player / inventory / gamemodes | 35 % | stacking, permissions attachments |
 | Commands | 40 % | map, aliases, permissions, player command execution |
-| Events | 20 % | 16 core events, cancel + patch-back |
+| Events | 30 % | core events incl. block break/place, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 75 % | login, packs, StartGame, chunks, spawn, chat/commands |
-| World (chunks, sections, block API) | 45 % | network chunk encoder added, still no LevelDB |
+| Network (RakNet/Bedrock) | 80 % | login, spawn, chunks, chat/commands, block updates |
+| World (chunks, sections, block API) | 55 % | chunk encoder, break/place, still no LevelDB |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |

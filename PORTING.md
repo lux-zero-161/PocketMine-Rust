@@ -48,6 +48,8 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | Client-Chat (`Text`) + `PlayerChatEvent` | ✅ | Broadcast zurück an alle Clients |
 | Client-Commands (`CommandRequest`) + Preprocess-Event | ✅ | Ausführung über die Command-Map |
 | Server-/Plugin-Nachrichten als `Text`-Pakete | ✅ | `flush_player_messages` sendet echt |
+| Block-Abbau (`PlayerAction`) + `UpdateBlock`-Broadcast | ✅ | Creative/Survival-Abbau, Event |
+| Block-Platzierung (`InventoryTransaction` UseItemOn) | ✅ | Item aus dem Paket, Event, Broadcast |
 | Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 
