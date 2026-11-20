@@ -3,15 +3,17 @@
 //! Implemented milestones:
 //! * Unconnected ping/pong, so the server appears in the Minecraft LAN list.
 //! * RakNet offline handshake (request 1/2, connection request, new incoming
-//!   connection) with MTU negotiation.
-//! * Datagram + encapsulated frame codec (reliable ordered) used by Bedrock.
+//!   connection) with MTU negotiation and ACKs.
+//! * Datagram + encapsulated frame codec, including **split frames** for
+//!   payloads larger than the MTU.
+//! * Bedrock packet batches (`varint length + packet`), raw-deflate
+//!   compression with the protocol 1.20.60+ compression-type prefix.
 //! * `RequestNetworkSettings` -> `NetworkSettings` (compression negotiation).
-//!
-//! The encrypted JWT login chain and the full packet handler are the next
-//! milestone; `Login` is currently answered with a PlayStatus so clients fail
-//! cleanly instead of hanging.
+//! * Offline-mode `Login` inspection (identity from the JWT chain) and a clean
+//!   `PlayStatus` rejection until the encrypted login milestone is complete.
 
 use pm_core::{Logger, RAKNET_MAGIC};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -35,12 +37,12 @@ pub mod protocol {
     pub const REMOVE_ENTITY: u8 = 0x0e;
     pub const MOVE_PLAYER: u8 = 0x12;
     pub const LEVEL_CHUNK: u8 = 0x3a;
-    pub const REQUEST_NETWORK_SETTINGS: u8 = 0x5a;
-    pub const NETWORK_SETTINGS: u8 = 0x8f;
     pub const REQUEST_CHUNK_RADIUS: u8 = 0x45;
     pub const CHUNK_RADIUS_UPDATED: u8 = 0x46;
+    pub const REQUEST_NETWORK_SETTINGS: u8 = 0x5a;
     pub const SET_LOCAL_PLAYER_AS_INITIALIZED: u8 = 0x71;
     pub const REQUEST_CAPABILITIES: u8 = 0x77;
+    pub const NETWORK_SETTINGS: u8 = 0x8f;
 
     pub const PLAY_STATUS_LOGIN_SUCCESS: i32 = 0;
     pub const PLAY_STATUS_LOGIN_FAILED_SERVER_FULL: i32 = 1;
@@ -69,9 +71,13 @@ const ID_NACK: u8 = 0xa0;
 
 const RAKNET_PROTOCOL_VERSION: u8 = 11;
 const DEFAULT_MTU: u16 = 1400;
+const DATAGRAM_HEADER_SIZE: usize = 4;
+
+const COMPRESSION_NONE: u8 = 0xff;
+const COMPRESSION_ZLIB: u8 = 0x00;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Small helpers
 // ---------------------------------------------------------------------------
 
 fn now_millis() -> i64 {
@@ -92,9 +98,9 @@ fn write_address(buf: &mut Vec<u8>, addr: SocketAddr) {
         }
         SocketAddr::V6(v6) => {
             buf.push(6);
-            buf.extend_from_slice(&[0u8; 8]); // address family
-            buf.extend_from_slice(&[0u8; 2]); // port
-            buf.extend_from_slice(&[0u8; 4]); // flow info
+            buf.extend_from_slice(&[0u8; 8]);
+            buf.extend_from_slice(&[0u8; 2]);
+            buf.extend_from_slice(&[0u8; 4]);
             buf.extend_from_slice(&v6.ip().octets());
             buf.extend_from_slice(&v6.port().to_be_bytes());
         }
@@ -105,8 +111,122 @@ fn read_magic(buf: &[u8], offset: usize) -> bool {
     buf.len() >= offset + 16 && &buf[offset..offset + 16] == RAKNET_MAGIC
 }
 
+pub fn write_varint(out: &mut Vec<u8>, mut value: u32) {
+    loop {
+        if value & !0x7f == 0 {
+            out.push(value as u8);
+            return;
+        }
+        out.push(((value & 0x7f) | 0x80) as u8);
+        value >>= 7;
+    }
+}
+
+pub fn read_varint(input: &[u8], offset: &mut usize) -> Option<u32> {
+    let mut value = 0u32;
+    let mut shift = 0;
+    loop {
+        let byte = *input.get(*offset)?;
+        *offset += 1;
+        value |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Encapsulated frame codec
+// Packet batches and compression
+// ---------------------------------------------------------------------------
+
+/// Encodes packets as a Bedrock batch (`varint length` before each packet).
+pub fn encode_batch(packets: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packets.iter().map(Vec::len).sum::<usize>() + packets.len());
+    for packet in packets {
+        write_varint(&mut out, packet.len() as u32);
+        out.extend_from_slice(packet);
+    }
+    out
+}
+
+/// Splits a batch back into individual packets.
+pub fn decode_batch(batch: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut packets = Vec::new();
+    let mut offset = 0usize;
+    while offset < batch.len() {
+        let length = read_varint(batch, &mut offset).ok_or("invalid packet length")? as usize;
+        if offset + length > batch.len() {
+            return Err("packet length exceeds batch".to_string());
+        }
+        packets.push(batch[offset..offset + length].to_vec());
+        offset += length;
+    }
+    Ok(packets)
+}
+
+/// Applies Bedrock's protocol >= 1.20.60 compression envelope. The first byte
+/// is the algorithm (`0` = zlib/raw deflate, `0xff` = none).
+pub fn compress_batch(batch: &[u8], threshold: usize) -> Vec<u8> {
+    use flate2::write::DeflateEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    if batch.len() < threshold {
+        let mut out = Vec::with_capacity(batch.len() + 1);
+        out.push(COMPRESSION_NONE);
+        out.extend_from_slice(batch);
+        return out;
+    }
+
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::new(7));
+    if encoder.write_all(batch).is_err() {
+        let mut out = Vec::with_capacity(batch.len() + 1);
+        out.push(COMPRESSION_NONE);
+        out.extend_from_slice(batch);
+        return out;
+    }
+    match encoder.finish() {
+        Ok(compressed) => {
+            let mut out = Vec::with_capacity(compressed.len() + 1);
+            out.push(COMPRESSION_ZLIB);
+            out.extend_from_slice(&compressed);
+            out
+        }
+        Err(_) => {
+            let mut out = Vec::with_capacity(batch.len() + 1);
+            out.push(COMPRESSION_NONE);
+            out.extend_from_slice(batch);
+            out
+        }
+    }
+}
+
+/// Removes the compression envelope and returns the raw batch.
+pub fn decompress_batch(payload: &[u8]) -> Result<Vec<u8>, String> {
+    use flate2::read::DeflateDecoder;
+    use std::io::Read;
+
+    let Some((&kind, body)) = payload.split_first() else {
+        return Err("empty compressed payload".to_string());
+    };
+    match kind {
+        COMPRESSION_NONE => Ok(body.to_vec()),
+        COMPRESSION_ZLIB => {
+            let mut decoder = DeflateDecoder::new(body);
+            let mut out = Vec::new();
+            decoder.read_to_end(&mut out).map_err(|e| e.to_string())?;
+            Ok(out)
+        }
+        other => Err(format!("unsupported compression algorithm {other}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Encapsulated frames
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +236,9 @@ pub struct Frame {
     pub sequence_index: Option<u32>,
     pub order_index: Option<u32>,
     pub order_channel: Option<u8>,
+    pub split_count: u32,
+    pub split_id: u16,
+    pub split_index: u32,
     pub payload: Vec<u8>,
 }
 
@@ -128,41 +251,43 @@ impl Frame {
             sequence_index: None,
             order_index: Some(order_index),
             order_channel: Some(0),
+            split_count: 0,
+            split_id: 0,
+            split_index: 0,
             payload,
         }
     }
 
+    pub fn is_split(&self) -> bool {
+        self.split_count > 0
+    }
+
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(0x80 | (self.reliability << 5)); // "is frame set" bit + reliability
-        let len = self.payload.len() as u16;
-        out.extend_from_slice(&len.to_be_bytes());
-        let mut reliable = false;
-        let mut sequenced = false;
-        let mut ordered = false;
-        match self.reliability {
-            2 | 3 | 4 | 6 | 7 => reliable = true,
-            _ => {}
+        let mut flags = 0x80 | (self.reliability << 5);
+        if self.is_split() {
+            flags |= 0x10;
         }
-        match self.reliability {
-            1 | 4 => sequenced = true,
-            3 | 7 => ordered = true,
-            _ => {}
-        }
+        out.push(flags);
+        out.extend_from_slice(&(self.payload.len() as u16).to_be_bytes());
+
+        let reliable = matches!(self.reliability, 2 | 3 | 4 | 6 | 7);
+        let sequenced = matches!(self.reliability, 1 | 4);
+        let ordered = matches!(self.reliability, 3 | 7);
+
         if reliable {
-            if let Some(i) = self.reliable_index {
-                out.extend_from_slice(&i.to_le_bytes());
-            }
+            out.extend_from_slice(&self.reliable_index.unwrap_or(0).to_le_bytes());
         }
         if sequenced {
-            if let Some(i) = self.sequence_index {
-                out.extend_from_slice(&i.to_le_bytes());
-            }
+            out.extend_from_slice(&self.sequence_index.unwrap_or(0).to_le_bytes());
         }
         if ordered {
-            if let Some(o) = self.order_index {
-                out.extend_from_slice(&o.to_le_bytes());
-                out.push(self.order_channel.unwrap_or(0));
-            }
+            out.extend_from_slice(&self.order_index.unwrap_or(0).to_le_bytes());
+            out.push(self.order_channel.unwrap_or(0));
+        }
+        if self.is_split() {
+            out.extend_from_slice(&self.split_count.to_be_bytes());
+            out.extend_from_slice(&self.split_id.to_be_bytes());
+            out.extend_from_slice(&self.split_index.to_be_bytes());
         }
         out.extend_from_slice(&self.payload);
     }
@@ -175,52 +300,43 @@ fn decode_frames(buf: &[u8]) -> Vec<Frame> {
         let flags = buf[i];
         i += 1;
         let reliability = (flags >> 5) & 0x07;
+        let split = flags & 0x10 != 0;
         let length = u16::from_be_bytes([buf[i], buf[i + 1]]) as usize;
         i += 2;
+
+        let reliable = matches!(reliability, 2 | 3 | 4 | 6 | 7);
+        let sequenced = matches!(reliability, 1 | 4);
+        let ordered = matches!(reliability, 3 | 7);
+
         let mut reliable_index = None;
         let mut sequence_index = None;
         let mut order_index = None;
         let mut order_channel = None;
-        let mut reliable = false;
-        let mut sequenced = false;
-        let mut ordered = false;
-        match reliability {
-            2 | 3 | 4 | 6 | 7 => reliable = true,
-            _ => {}
-        }
-        match reliability {
-            1 | 4 => sequenced = true,
-            3 | 7 => ordered = true,
-            _ => {}
-        }
+
         if reliable && i + 4 <= buf.len() {
-            reliable_index = Some(u32::from_le_bytes([
-                buf[i],
-                buf[i + 1],
-                buf[i + 2],
-                buf[i + 3],
-            ]));
+            reliable_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
             i += 4;
         }
         if sequenced && i + 4 <= buf.len() {
-            sequence_index = Some(u32::from_le_bytes([
-                buf[i],
-                buf[i + 1],
-                buf[i + 2],
-                buf[i + 3],
-            ]));
+            sequence_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
             i += 4;
         }
         if ordered && i + 5 <= buf.len() {
-            order_index = Some(u32::from_le_bytes([
-                buf[i],
-                buf[i + 1],
-                buf[i + 2],
-                buf[i + 3],
-            ]));
+            order_index = Some(u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]));
             order_channel = Some(buf[i + 4]);
             i += 5;
         }
+
+        let mut split_count = 0;
+        let mut split_id = 0;
+        let mut split_index = 0;
+        if split && i + 10 <= buf.len() {
+            split_count = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]);
+            split_id = u16::from_be_bytes([buf[i + 4], buf[i + 5]]);
+            split_index = u32::from_be_bytes([buf[i + 6], buf[i + 7], buf[i + 8], buf[i + 9]]);
+            i += 10;
+        }
+
         if i + length > buf.len() {
             break;
         }
@@ -230,6 +346,9 @@ fn decode_frames(buf: &[u8]) -> Vec<Frame> {
             sequence_index,
             order_index,
             order_channel,
+            split_count,
+            split_id,
+            split_index,
             payload: buf[i..i + length].to_vec(),
         });
         i += length;
@@ -238,7 +357,7 @@ fn decode_frames(buf: &[u8]) -> Vec<Frame> {
 }
 
 fn encode_datagram(sequence: u32, frames: &[Frame]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
+    let mut out = Vec::with_capacity(64);
     out.push(ID_DATAGRAM);
     out.extend_from_slice(&(sequence & 0x00ff_ffff).to_be_bytes()[1..]);
     for frame in frames {
@@ -255,6 +374,61 @@ fn encode_ack(sequences: &[u32]) -> Vec<u8> {
         out.extend_from_slice(&(seq & 0x00ff_ffff).to_be_bytes()[1..]);
     }
     out
+}
+
+/// Reassembles split frames for one session.
+#[derive(Debug, Default)]
+pub struct SplitAssembly {
+    count: u32,
+    received: u32,
+    parts: Vec<Option<Vec<u8>>>,
+}
+
+impl SplitAssembly {
+    pub fn new(count: u32) -> Self {
+        Self { count, received: 0, parts: vec![None; count as usize] }
+    }
+
+    /// Returns the complete payload once every fragment has arrived.
+    pub fn push(&mut self, index: u32, payload: Vec<u8>) -> Option<Vec<u8>> {
+        let index = index as usize;
+        if index >= self.parts.len() || self.parts[index].is_some() {
+            return None;
+        }
+        self.parts[index] = Some(payload);
+        self.received += 1;
+        if self.received < self.count {
+            return None;
+        }
+        let mut out = Vec::new();
+        for part in self.parts.iter() {
+            out.extend_from_slice(part.as_ref()?);
+        }
+        Some(out)
+    }
+}
+
+/// Splits a payload into frames small enough for the given MTU.
+pub fn split_payload(payload: &[u8], mtu: usize, reliable_start: u32, order_start: u32) -> Vec<Frame> {
+    let max = mtu.saturating_sub(DATAGRAM_HEADER_SIZE + 3 + 10 + 5 + 32).max(256);
+    if payload.len() <= max {
+        return vec![Frame::reliable_ordered(payload.to_vec(), reliable_start, order_start)];
+    }
+    let count = payload.len().div_ceil(max);
+    let split_id = (reliable_start & 0xffff) as u16;
+    let mut frames = Vec::with_capacity(count);
+    for (index, chunk) in payload.chunks(max).enumerate() {
+        let mut frame = Frame::reliable_ordered(
+            chunk.to_vec(),
+            reliable_start.wrapping_add(index as u32),
+            order_start.wrapping_add(index as u32),
+        );
+        frame.split_count = count as u32;
+        frame.split_id = split_id;
+        frame.split_index = index as u32;
+        frames.push(frame);
+    }
+    frames
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +483,7 @@ pub enum SessionState {
     Connected,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Session {
     pub address: SocketAddr,
     pub mtu: u16,
@@ -319,6 +493,8 @@ pub struct Session {
     pub order_index: u32,
     pub last_seen: i64,
     pub compression_threshold: u16,
+    pub compression_enabled: bool,
+    split_assemblies: HashMap<u16, SplitAssembly>,
 }
 
 impl Session {
@@ -332,6 +508,8 @@ impl Session {
             order_index: 0,
             last_seen: now_millis(),
             compression_threshold: 256,
+            compression_enabled: false,
+            split_assemblies: HashMap::new(),
         }
     }
 
@@ -341,17 +519,15 @@ impl Session {
         seq
     }
 
-    fn next_reliable(&mut self) -> u32 {
-        let idx = self.reliable_index;
-        self.reliable_index = self.reliable_index.wrapping_add(1);
-        idx
-    }
+}
 
-    fn next_order(&mut self) -> u32 {
-        let idx = self.order_index;
-        self.order_index = self.order_index.wrapping_add(1);
-        idx
-    }
+/// Identity extracted from an offline-mode Login packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginIdentity {
+    pub protocol: u32,
+    pub display_name: String,
+    pub identity: String,
+    pub xuid: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -362,6 +538,8 @@ pub struct NetworkStats {
     pub datagrams_in: u64,
     pub datagrams_out: u64,
     pub frames_in: u64,
+    pub batches_in: u64,
+    pub logins: u64,
     pub unknown_packets: u64,
 }
 
@@ -376,26 +554,17 @@ pub struct BedrockNetworkServer {
     pong: Arc<RwLock<PongData>>,
     sessions: Arc<RwLock<HashMap<SocketAddr, Session>>>,
     stats: Arc<RwLock<NetworkStats>>,
-    /// Callback invoked for each decoded Bedrock game packet.
     packet_handler: Arc<RwLock<Option<Box<dyn FnMut(SocketAddr, &[u8]) + Send + Sync>>>>,
     next_guid: AtomicU64,
-    compression_threshold: u16,
 }
 
 impl BedrockNetworkServer {
-    pub fn bind(
-        bind_addr: &str,
-        motd: &str,
-        max_players: usize,
-        logger: Arc<Logger>,
-    ) -> io::Result<Self> {
+    pub fn bind(bind_addr: &str, motd: &str, max_players: usize, logger: Arc<Logger>) -> io::Result<Self> {
         let socket = UdpSocket::bind(bind_addr)?;
         socket.set_nonblocking(true)?;
         let local = socket.local_addr()?;
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let guid = (now.as_nanos() as i64).wrapping_mul(31) | 1;
 
         let pong = PongData {
@@ -408,7 +577,7 @@ impl BedrockNetworkServer {
             server_guid: guid,
             gamemode: "Survival".to_string(),
             port_v4: local.port(),
-            port_v6: local.port() + 1,
+            port_v6: local.port().saturating_add(1),
         };
 
         logger.info(&format!(
@@ -427,7 +596,6 @@ impl BedrockNetworkServer {
             stats: Arc::new(RwLock::new(NetworkStats::default())),
             packet_handler: Arc::new(RwLock::new(None)),
             next_guid: AtomicU64::new(guid as u64),
-            compression_threshold: 256,
         })
     }
 
@@ -507,11 +675,14 @@ impl BedrockNetworkServer {
         let ping_time = i64::from_be_bytes(data[1..9].try_into().unwrap());
         self.stats.write().unwrap().pings += 1;
 
-        let pong_text = self.pong.read().unwrap().encode();
+        let (pong_text, guid) = {
+            let pong = self.pong.read().unwrap();
+            (pong.encode(), pong.server_guid as u64)
+        };
         let mut out = Vec::with_capacity(35 + pong_text.len());
         out.push(ID_UNCONNECTED_PONG);
         out.extend_from_slice(&ping_time.to_be_bytes());
-        out.extend_from_slice(&(self.pong.read().unwrap().server_guid as u64).to_be_bytes());
+        out.extend_from_slice(&guid.to_be_bytes());
         out.extend_from_slice(&RAKNET_MAGIC);
         out.extend_from_slice(&(pong_text.len() as u16).to_be_bytes());
         out.extend_from_slice(pong_text.as_bytes());
@@ -534,8 +705,8 @@ impl BedrockNetworkServer {
         let mut out = Vec::with_capacity(28);
         out.push(ID_OPEN_CONNECTION_REPLY_1);
         out.extend_from_slice(&RAKNET_MAGIC);
-        out.extend_from_slice(&(self.next_guid.load(Ordering::Relaxed)).to_be_bytes());
-        out.push(0); // security disabled
+        out.extend_from_slice(&self.next_guid.load(Ordering::Relaxed).to_be_bytes());
+        out.push(0);
         out.extend_from_slice(&mtu.to_be_bytes());
         let _ = self.socket.send_to(&out, addr);
         self.stats.write().unwrap().handshakes += 1;
@@ -545,9 +716,7 @@ impl BedrockNetworkServer {
         if data.len() < 19 || !read_magic(data, 1) {
             return;
         }
-        // Client address follows the magic; MTU is the two bytes before the
-        // 8-byte client GUID at the end.
-        let mtu = if data.len() >= data.len().saturating_sub(10) + 1 {
+        let mtu = if data.len() >= 10 {
             u16::from_be_bytes([data[data.len() - 10], data[data.len() - 9]])
         } else {
             DEFAULT_MTU
@@ -556,16 +725,13 @@ impl BedrockNetworkServer {
         let mut out = Vec::with_capacity(32);
         out.push(ID_OPEN_CONNECTION_REPLY_2);
         out.extend_from_slice(&RAKNET_MAGIC);
-        out.extend_from_slice(&(self.next_guid.load(Ordering::Relaxed)).to_be_bytes());
+        out.extend_from_slice(&self.next_guid.load(Ordering::Relaxed).to_be_bytes());
         write_address(&mut out, addr);
         out.extend_from_slice(&mtu.to_be_bytes());
-        out.push(0); // encryption disabled
+        out.push(0);
         let _ = self.socket.send_to(&out, addr);
 
-        self.sessions
-            .write()
-            .unwrap()
-            .insert(addr, Session::new(addr, mtu));
+        self.sessions.write().unwrap().insert(addr, Session::new(addr, mtu));
         self.stats.write().unwrap().handshakes += 1;
     }
 
@@ -577,7 +743,7 @@ impl BedrockNetworkServer {
         let mut out = Vec::with_capacity(128);
         out.push(ID_CONNECTION_REQUEST_ACCEPTED);
         write_address(&mut out, addr);
-        out.extend_from_slice(&0u16.to_be_bytes()); // system index
+        out.extend_from_slice(&0u16.to_be_bytes());
         for _ in 0..10 {
             write_address(&mut out, addr);
         }
@@ -590,8 +756,7 @@ impl BedrockNetworkServer {
         if let Some(session) = self.sessions.write().unwrap().get_mut(&addr) {
             session.state = SessionState::Connected;
         }
-        self.logger
-            .debug(&format!("RakNet client connected: {}", addr));
+        self.logger.debug(&format!("RakNet client connected: {}", addr));
     }
 
     fn handle_datagram_frame(&self, addr: SocketAddr, data: &[u8]) {
@@ -601,30 +766,36 @@ impl BedrockNetworkServer {
         let sequence = u32::from_be_bytes([0, data[1], data[2], data[3]]);
         let frames = decode_frames(&data[4..]);
 
-        self.stats.write().unwrap().datagrams_in += 1;
-        self.stats.write().unwrap().frames_in += frames.len() as u64;
+        let compression_enabled = {
+            let sessions = self.sessions.read().unwrap();
+            sessions.get(&addr).map(|s| s.compression_enabled).unwrap_or(false)
+        };
+
+        {
+            let mut stats = self.stats.write().unwrap();
+            stats.datagrams_in += 1;
+            stats.frames_in += frames.len() as u64;
+        }
 
         for frame in frames {
-            if frame.payload.is_empty() {
-                continue;
-            }
-            let packet_id = frame.payload[0];
-            match packet_id {
-                REQUEST_NETWORK_SETTINGS => self.send_network_settings(addr, sequence),
-                LOGIN => {
-                    // Full JWT/Xbox verification and player spawn are the next
-                    // milestone. Reject cleanly with a PlayStatus packet.
-                    self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
-                    self.logger.info(&format!(
-                        "Rejected login from {}: Bedrock login/encryption is not ported yet",
-                        addr
-                    ));
+            let payload = if frame.is_split() {
+                let mut sessions = self.sessions.write().unwrap();
+                let Some(session) = sessions.get_mut(&addr) else { continue };
+                let assembly = session
+                    .split_assemblies
+                    .entry(frame.split_id)
+                    .or_insert_with(|| SplitAssembly::new(frame.split_count));
+                let complete = assembly.push(frame.split_index, frame.payload);
+                if complete.is_some() {
+                    session.split_assemblies.remove(&frame.split_id);
                 }
-                _ => {
-                    if let Some(handler) = self.packet_handler.write().unwrap().as_mut() {
-                        handler(addr, &frame.payload);
-                    }
-                }
+                complete
+            } else {
+                Some(frame.payload)
+            };
+
+            if let Some(payload) = payload {
+                self.handle_payload(addr, &payload, compression_enabled);
             }
         }
 
@@ -632,40 +803,131 @@ impl BedrockNetworkServer {
         let _ = self.socket.send_to(&ack, addr);
     }
 
-    fn send_network_settings(&self, addr: SocketAddr, _sequence: u32) {
-        let mut payload = Vec::with_capacity(6);
-        payload.push(NETWORK_SETTINGS);
-        payload.extend_from_slice(&self.compression_threshold.to_le_bytes()); // zlib threshold
-        payload.extend_from_slice(&0u16.to_le_bytes()); // compression algorithm: zlib
-        payload.extend_from_slice(&self.compression_threshold.to_le_bytes()); // client-side threshold
+    fn handle_payload(&self, addr: SocketAddr, payload: &[u8], compression_enabled: bool) {
+        let batch = if compression_enabled {
+            match decompress_batch(payload) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    self.logger.debug(&format!("Bad compressed batch from {}: {}", addr, err));
+                    return;
+                }
+            }
+        } else {
+            payload.to_vec()
+        };
 
-        self.send_frame_packets(addr, vec![payload]);
+        let packets = match decode_batch(&batch) {
+            Ok(packets) => packets,
+            Err(err) => {
+                self.logger.debug(&format!("Bad packet batch from {}: {}", addr, err));
+                return;
+            }
+        };
+        self.stats.write().unwrap().batches_in += 1;
+
+        for packet in packets {
+            if packet.is_empty() {
+                continue;
+            }
+            self.handle_packet(addr, &packet);
+        }
+    }
+
+    fn handle_packet(&self, addr: SocketAddr, packet: &[u8]) {
+        match packet[0] {
+            REQUEST_NETWORK_SETTINGS => self.send_network_settings(addr),
+            LOGIN => {
+                self.stats.write().unwrap().logins += 1;
+                match parse_login(packet) {
+                    Some(identity) => self.logger.info(&format!(
+                        "Login attempt from {}: \"{}\" ({}) protocol {}",
+                        addr, identity.display_name, identity.identity, identity.protocol
+                    )),
+                    None => self.logger.debug(&format!("Could not parse Login packet from {}", addr)),
+                }
+                // Encryption + StartGame are the next milestone. Reject cleanly
+                // instead of leaving the client hanging.
+                self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
+            }
+            CLIENT_TO_SERVER_HANDSHAKE => {
+                self.logger.debug(&format!("ClientToServerHandshake from {}", addr));
+            }
+            _ => {
+                if let Some(handler) = self.packet_handler.write().unwrap().as_mut() {
+                    handler(addr, packet);
+                }
+            }
+        }
+    }
+
+    fn send_network_settings(&self, addr: SocketAddr) {
+        let mut payload = Vec::with_capacity(7);
+        payload.push(NETWORK_SETTINGS);
+        payload.extend_from_slice(&256u16.to_le_bytes()); // threshold
+        payload.extend_from_slice(&0u16.to_le_bytes()); // zlib
+        payload.extend_from_slice(&256u16.to_le_bytes()); // client threshold
+
+        // NetworkSettings is the last uncompressed batch.
+        self.send_packets(addr, vec![payload], Some(false));
+
+        if let Some(session) = self.sessions.write().unwrap().get_mut(&addr) {
+            session.compression_enabled = true;
+            session.compression_threshold = 256;
+        }
     }
 
     fn send_play_status(&self, addr: SocketAddr, status: i32) {
         let mut payload = Vec::with_capacity(5);
         payload.push(PLAY_STATUS);
         payload.extend_from_slice(&status.to_be_bytes());
-        self.send_frame_packets(addr, vec![payload]);
+        self.send_packets(addr, vec![payload], None);
     }
 
-    /// Sends game packets as reliable ordered frames inside a RakNet datagram.
-    pub fn send_frame_packets(&self, addr: SocketAddr, packets: Vec<Vec<u8>>) {
-        let Some(mut session) = self.sessions.write().unwrap().remove(&addr) else {
-            return;
-        };
-        let mut frames = Vec::with_capacity(packets.len());
-        for payload in packets {
-            let reliable = session.next_reliable();
-            let order = session.next_order();
-            frames.push(Frame::reliable_ordered(payload, reliable, order));
-        }
-        let sequence = session.next_datagram_sequence();
-        self.sessions.write().unwrap().insert(addr, session);
+    /// Sends game packets as a Bedrock batch, split across RakNet frames when
+    /// the payload exceeds the negotiated MTU.
+    pub fn send_packets(&self, addr: SocketAddr, packets: Vec<Vec<u8>>, compress_override: Option<bool>) {
+        let mut datagrams = Vec::new();
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            let Some(session) = sessions.get_mut(&addr) else { return };
 
-        let datagram = encode_datagram(sequence, &frames);
-        let _ = self.socket.send_to(&datagram, addr);
-        self.stats.write().unwrap().datagrams_out += 1;
+            let batch = encode_batch(&packets);
+            let compress = compress_override.unwrap_or(session.compression_enabled);
+            let payload = if compress {
+                compress_batch(&batch, session.compression_threshold as usize)
+            } else {
+                batch
+            };
+
+            let mtu = session.mtu as usize;
+            let frames = split_payload(&payload, mtu, session.reliable_index, session.order_index);
+            session.reliable_index = session.reliable_index.wrapping_add(frames.len() as u32);
+            session.order_index = session.order_index.wrapping_add(frames.len() as u32);
+
+            let mut current: Vec<Frame> = Vec::new();
+            let mut current_size = DATAGRAM_HEADER_SIZE;
+            for frame in frames {
+                let mut encoded = Vec::new();
+                frame.encode(&mut encoded);
+                if current_size + encoded.len() > mtu && !current.is_empty() {
+                    let sequence = session.next_datagram_sequence();
+                    datagrams.push(encode_datagram(sequence, &current));
+                    current.clear();
+                    current_size = DATAGRAM_HEADER_SIZE;
+                }
+                current_size += encoded.len();
+                current.push(frame);
+            }
+            if !current.is_empty() {
+                let sequence = session.next_datagram_sequence();
+                datagrams.push(encode_datagram(sequence, &current));
+            }
+        }
+
+        for datagram in datagrams {
+            let _ = self.socket.send_to(&datagram, addr);
+            self.stats.write().unwrap().datagrams_out += 1;
+        }
     }
 
     pub fn disconnect(&self, addr: SocketAddr) {
@@ -682,6 +944,93 @@ impl Drop for BedrockNetworkServer {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Login parsing (offline mode)
+// ---------------------------------------------------------------------------
+
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => continue,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let data = base64url_decode(payload)?;
+    serde_json::from_slice(&data).ok()
+}
+
+/// Parses a Login packet and extracts the player identity without verifying
+/// signatures. Signature/Xbox validation belongs to the encrypted login
+/// milestone; this is enough for offline-mode identity and logging.
+pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
+    if packet.len() < 7 || packet[0] != LOGIN {
+        return None;
+    }
+    let protocol = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+    let mut offset = 5usize;
+    let request_len = read_varint(packet, &mut offset)? as usize;
+    if offset + request_len > packet.len() {
+        return None;
+    }
+    let request = &packet[offset..offset + request_len];
+    if request.len() < 4 {
+        return None;
+    }
+
+    let chain_len = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
+    let chain_start = 4usize;
+    let chain_end = chain_start.checked_add(chain_len)?;
+    if chain_end > request.len() {
+        return None;
+    }
+    let chain_json: Value = serde_json::from_slice(&request[chain_start..chain_end]).ok()?;
+    let chain = chain_json.get("chain")?.as_array()?;
+
+    let mut display_name = String::new();
+    let mut identity = String::new();
+    let mut xuid = String::new();
+    for token in chain {
+        let Some(payload) = jwt_payload(token.as_str()?) else { continue };
+        if let Some(extra) = payload.get("extraData") {
+            if display_name.is_empty() {
+                display_name = extra.get("displayName").and_then(Value::as_str).unwrap_or("").to_string();
+            }
+            if xuid.is_empty() {
+                xuid = extra.get("XUID").and_then(Value::as_str).unwrap_or("").to_string();
+            }
+        }
+        if identity.is_empty() {
+            identity = payload.get("identity").and_then(Value::as_str).unwrap_or("").to_string();
+        }
+    }
+
+    if display_name.is_empty() && identity.is_empty() {
+        return None;
+    }
+    Some(LoginIdentity { protocol, display_name, identity, xuid })
 }
 
 #[cfg(test)]
@@ -728,15 +1077,189 @@ mod tests {
     }
 
     #[test]
+    fn split_frames_reassemble() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let frames = split_payload(&payload, 400, 1, 1);
+        assert!(frames.len() > 1);
+        assert!(frames.iter().all(|f| f.is_split()));
+
+        let mut encoded = Vec::new();
+        for frame in &frames {
+            frame.encode(&mut encoded);
+        }
+        let decoded = decode_frames(&encoded);
+        assert_eq!(decoded.len(), frames.len());
+
+        let mut assembly = SplitAssembly::new(decoded[0].split_count);
+        let mut complete = None;
+        for frame in decoded {
+            if let Some(result) = assembly.push(frame.split_index, frame.payload) {
+                complete = Some(result);
+            }
+        }
+        assert_eq!(complete, Some(payload));
+    }
+
+    #[test]
+    fn batch_roundtrip() {
+        let packets = vec![vec![0x01, 2, 3], vec![0xff; 300]];
+        let batch = encode_batch(&packets);
+        assert_eq!(decode_batch(&batch).unwrap(), packets);
+    }
+
+    #[test]
+    fn compression_roundtrip_and_threshold() {
+        let small = vec![0x09, 1, 2, 3];
+        let compressed = compress_batch(&small, 256);
+        assert_eq!(compressed[0], COMPRESSION_NONE);
+        assert_eq!(decompress_batch(&compressed).unwrap(), small);
+
+        let large = vec![0x3a; 4096];
+        let compressed = compress_batch(&large, 256);
+        assert_eq!(compressed[0], COMPRESSION_ZLIB);
+        assert!(compressed.len() < large.len());
+        assert_eq!(decompress_batch(&compressed).unwrap(), large);
+    }
+
+    fn build_login_packet() -> Vec<u8> {
+        let payload = serde_json::json!({
+            "identity": "00000000-0000-0000-0000-000000000001",
+            "extraData": { "displayName": "Steve", "XUID": "" }
+        })
+        .to_string();
+        let header = base64url_encode(b"{\"alg\":\"none\"}");
+        let body = base64url_encode(payload.as_bytes());
+        let token = format!("{header}.{body}.");
+        let chain = format!("{{\"chain\":[\"{token}\"]}}");
+
+        let mut request = Vec::new();
+        request.extend_from_slice(&(chain.len() as u32).to_le_bytes());
+        request.extend_from_slice(chain.as_bytes());
+        request.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut packet = vec![LOGIN];
+        packet.extend_from_slice(&2225u32.to_be_bytes());
+        write_varint(&mut packet, request.len() as u32);
+        packet.extend_from_slice(&request);
+        packet
+    }
+
+    #[test]
+    fn parses_offline_login_identity() {
+        let packet = build_login_packet();
+        let identity = parse_login(&packet).expect("login must parse");
+        assert_eq!(identity.display_name, "Steve");
+        assert_eq!(identity.identity, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(identity.protocol, 2225);
+    }
+
+    fn base64url_encode(input: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        let mut buffer = 0u32;
+        let mut bits = 0u32;
+        for byte in input {
+            buffer = (buffer << 8) | *byte as u32;
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                out.push(ALPHABET[((buffer >> bits) & 0x3f) as usize] as char);
+            }
+        }
+        if bits > 0 {
+            out.push(ALPHABET[((buffer << (6 - bits)) & 0x3f) as usize] as char);
+        }
+        out
+    }
+
+    fn raknet_handshake(client: &UdpSocket, server: &BedrockNetworkServer) {
+        let addr = server.local_addr().unwrap();
+
+        let mut request1 = vec![ID_OPEN_CONNECTION_REQUEST_1];
+        request1.extend_from_slice(&RAKNET_MAGIC);
+        request1.push(RAKNET_PROTOCOL_VERSION);
+        request1.extend_from_slice(&[0u8; 1300]);
+        client.send_to(&request1, addr).unwrap();
+        server.process_packets();
+        let mut buf = [0u8; 2048];
+        let (len, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], ID_OPEN_CONNECTION_REPLY_1, "len={len}");
+        let mtu = u16::from_be_bytes([buf[len - 2], buf[len - 1]]);
+
+        let mut request2 = vec![ID_OPEN_CONNECTION_REQUEST_2];
+        request2.extend_from_slice(&RAKNET_MAGIC);
+        request2.extend_from_slice(&[4, 127, 0, 0, 1, 0x4f, 0x9f]);
+        request2.extend_from_slice(&mtu.to_be_bytes());
+        request2.extend_from_slice(&7i64.to_be_bytes());
+        client.send_to(&request2, addr).unwrap();
+        server.process_packets();
+        let (len2, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], ID_OPEN_CONNECTION_REPLY_2, "len={len2}");
+
+        let mut incoming = vec![ID_NEW_INCOMING_CONNECTION];
+        write_address(&mut incoming, client.local_addr().unwrap());
+        incoming.extend_from_slice(&[0u8; 8]);
+        client.send_to(&incoming, addr).unwrap();
+        server.process_packets();
+    }
+
+    fn recv_game_payload(client: &UdpSocket) -> Vec<u8> {
+        let mut buf = [0u8; 4096];
+        for _ in 0..8 {
+            let (len, _) = client.recv_from(&mut buf).unwrap();
+            if buf[0] != ID_DATAGRAM {
+                continue; // ACK/NACK
+            }
+            let frames = decode_frames(&buf[4..len]);
+            assert!(!frames.is_empty());
+            return frames.into_iter().map(|frame| frame.payload).flatten().collect();
+        }
+        panic!("no game datagram received");
+    }
+
+    fn send_frames(client: &UdpSocket, server: &BedrockNetworkServer, payload: &[u8], sequence: u32) {
+        let frames = split_payload(payload, 1400, 0, 0);
+        let datagram = encode_datagram(sequence, &frames);
+        client.send_to(&datagram, server.local_addr().unwrap()).unwrap();
+        server.process_packets();
+    }
+
+    #[test]
+    fn network_settings_and_login_rejection_roundtrip() {
+        let logger = Arc::new(Logger::new("test"));
+        let server = BedrockNetworkServer::bind("127.0.0.1:0", "Test", 10, logger).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
+        raknet_handshake(&client, &server);
+
+        // 1. RequestNetworkSettings -> uncompressed NetworkSettings batch.
+        send_frames(&client, &server, &encode_batch(&[vec![REQUEST_NETWORK_SETTINGS]]), 1);
+        let settings_payload = recv_game_payload(&client);
+        let packets = decode_batch(&settings_payload).expect("settings batch");
+        assert_eq!(packets[0][0], NETWORK_SETTINGS);
+        assert_eq!(u16::from_le_bytes([packets[0][1], packets[0][2]]), 256);
+
+        // 2. Compressed Login batch -> compressed PlayStatus rejection.
+        send_frames(&client, &server, &compress_batch(&encode_batch(&[build_login_packet()]), 256), 2);
+        let status_payload = recv_game_payload(&client);
+        let batch = decompress_batch(&status_payload).expect("status compression");
+        let packets = decode_batch(&batch).expect("status batch");
+        assert_eq!(packets[0][0], PLAY_STATUS);
+        assert_eq!(
+            i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
+            PLAY_STATUS_LOGIN_FAILED_SERVER_OLD
+        );
+        assert_eq!(server.stats().logins, 1);
+    }
+
+    #[test]
     fn answers_unconnected_ping() {
         let logger = Arc::new(Logger::new("test"));
         let server = BedrockNetworkServer::bind("127.0.0.1:0", "Test MOTD", 10, logger).unwrap();
         let bind = server.local_addr().unwrap();
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-            .unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(500))).unwrap();
         let mut ping = vec![ID_UNCONNECTED_PING];
         ping.extend_from_slice(&123i64.to_be_bytes());
         ping.extend_from_slice(&RAKNET_MAGIC);

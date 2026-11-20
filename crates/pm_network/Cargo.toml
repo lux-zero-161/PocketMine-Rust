@@ -7,3 +7,5 @@ description = "PocketMine-Rust Bedrock/RakNet UDP network layer"
 
 [dependencies]
 pm_core = { path = "../pm_core" }
+flate2 = { workspace = true }
+serde_json = { workspace = true }

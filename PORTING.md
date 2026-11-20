@@ -29,8 +29,11 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | C#-Scheduler + Config + World-/Block-API | ✅ | `Server.Scheduler`, `world.SetBlock` |
 | RakNet: Unconnected Ping/Pong (LAN-Liste) | ✅ | `tools/ping.py` |
 | RakNet: Offline-Handshake (Request 1/2) | ✅ | Reply 1/2 mit MTU/GUID |
-| Bedrock `RequestNetworkSettings` → `NetworkSettings` | ✅ | Frame-Codec + ACK |
-| Bedrock Login / JWT / Verschlüsselung | ⏳ | Client erhält sauberen `PlayStatus` |
+| RakNet: ACKs, Split-Frames, Reassembly | ✅ | Tests in `pm_network` |
+| Bedrock-Batches + Raw-Deflate-Kompression | ✅ | Threshold 256, Typ-Präfix 1.20.60+ |
+| Bedrock `RequestNetworkSettings` → `NetworkSettings` | ✅ | Ende-zu-Ende-Netzwerktest |
+| Offline-`Login` parsen (Identität aus JWT-Chain) | ✅ | Name/UUID/XUID, ohne Signaturprüfung |
+| Bedrock Login / JWT-Signatur / Verschlüsselung | ⏳ | Client erhält sauberen `PlayStatus` |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 
 ---
@@ -44,7 +47,7 @@ Zeilenzahlen aus `../PocketMine-MP/src`. Status: ✅ vorhanden, 🟡 teilweise,
 |---|---:|---:|---|---|
 | `block/` | 494 | 41.092 | `pm_world::Block`, `pm_data` | 🟡 Registry + Platzieren/Abbauen |
 | `world/` | 299 | 24.606 | `pm_world`, `pm_scheduler` | 🟡 Chunks/Zeit/Generator, kein Save-Format |
-| `network/` | 111 | 16.237 | `pm_network` | 🟡 RakNet + Settings, kein Login |
+| `network/` | 111 | 16.237 | `pm_network` | 🟡 RakNet, Batches, Kompression; Login-Verschlüsselung offen |
 | `entity/` | 178 | 14.937 | `pm_world::Entity` | ⏳ nur Basismodell |
 | `item/` | 174 | 14.460 | `pm_player::ItemStack`, `pm_data` | 🟡 Stacks + Registry |
 | `data/` | 101 | 13.210 | `pm_data` | 🟡 bedrock-data, keine Upgrader |

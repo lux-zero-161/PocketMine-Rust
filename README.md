@@ -37,7 +37,9 @@ Verified by `./tools/smoke-test.sh`:
 | C# commands, aliases, permissions | ✅ |
 | C# scheduler, config, player/world/block/inventory API | ✅ |
 | RakNet ping/pong (server appears in LAN list) | ✅ |
-| RakNet offline handshake + Bedrock `NetworkSettings` | ✅ |
+| RakNet offline handshake, ACKs, split frames | ✅ |
+| Bedrock packet batches + raw-deflate compression | ✅ |
+| Bedrock `NetworkSettings` + offline `Login` parsing | ✅ |
 | Bedrock login (JWT/encryption), chunk streaming, entities | ⏳ roadmap |
 
 ### Progress by subsystem
@@ -58,7 +60,7 @@ gameplay and protocol coverage.
 | Commands | 35 % | map, aliases, permissions, 19 built-ins |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 20 % | ping, offline handshake, frames, `NetworkSettings` |
+| Network (RakNet/Bedrock) | 30 % | ping, handshake, batches, split frames, compression, login parsing |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
