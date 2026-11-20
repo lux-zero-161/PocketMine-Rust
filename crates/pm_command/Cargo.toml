@@ -1,7 +1,7 @@
 [package]
 name = "pm_command"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "PocketMine-Rust Command System"
 
 [dependencies]

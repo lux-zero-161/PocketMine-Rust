@@ -3,8 +3,11 @@ resolver = "2"
 members = [
     "crates/pm_core",
     "crates/pm_math",
+    "crates/pm_data",
     "crates/pm_event",
+    "crates/pm_permission",
     "crates/pm_command",
+    "crates/pm_scheduler",
     "crates/pm_world",
     "crates/pm_player",
     "crates/pm_network",
@@ -12,6 +15,18 @@ members = [
     "crates/pm_server",
 ]
 
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "LGPL-3.0"
+
 [workspace.dependencies]
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,103 +1,137 @@
 # PocketMine-Rust
 
-A high-performance Minecraft: Bedrock Edition server software written in **Rust** with native in-process **C# (.NET 10)** plugin support.
+A **1:1 port of [PocketMine-MP](https://github.com/pmmp/PocketMine-MP) to Rust**, with
+**plugins written in C# (.NET 10)** that run in-process inside the Rust server.
 
-PocketMine-Rust ports the architecture of [PocketMine-MP](https://github.com/pmmp/PocketMine-MP) to modern Rust for maximum concurrency, memory safety, and low latency, while providing a powerful C# Plugin API for developers.
+* Engine: **Rust** (safe, fast, single-threaded world tick like PMMP, multi-threaded console/network I/O)
+* Plugins: **C#** via the real CoreCLR (`hostfxr`), no sockets, no IPC
+* Target: **Minecraft: Bedrock Edition 1.26.60**, protocol **2225**
+* Plugin API: **PocketMine.Sdk 1.0.0.0**, modelled on PMMP's plugin API
 
----
-
-## 🌟 Key Features
-
-- **Blazing Fast Server Core (Rust)**:
-  - 20 TPS asynchronous server tick loop with sub-millisecond precision.
-  - Multi-threaded console input, packet dispatcher, and world ticking.
-  - UDP RakNet network engine implementing Minecraft Bedrock Edition protocol (v685 / v1.21+).
-  - Modern Chunk / SubChunk voxel world representation with flat generation and block ticking.
-  - Full player session, inventory (36 slots + 4 armor + offhand), permissions, and command system.
-- **Native C# (.NET 10) Plugin System**:
-  - Plugins are written in **100% C#** (.NET 10 class libraries).
-  - Hosted directly inside the Rust server process via official Microsoft `.NET CoreCLR` (`hostfxr`).
-  - Zero socket / IPC overhead: ultra-fast in-process C-ABI / FFI interop.
-  - Supports modern C# features: LINQ, async/await, reflection, NuGet dependencies, etc.
-  - Event bus with `@EventHandler` priority system (`Lowest` to `Monitor`) and event cancellation.
-  - Dynamic command registration directly from C# into the Rust server command map.
-- **Cross-Platform**:
-  - Native Linux binary (`pocketmine` / `PocketMine` / `./start.sh`)
-  - Native Windows binary (`PocketMine.exe` / `start.cmd` / `start.ps1`)
+The PHP reference lives in `../PocketMine-MP` (1,797 files / 168,434 lines).
+Porting progress, namespace mapping and the milestone plan are in
+[`PORTING.md`](PORTING.md).
 
 ---
 
-## 📁 Repository Structure
+## Fortschritt (Stand: 20.11.2026)
+
+**Kurzfassung:** Der komplette Stack läuft – Rust-Core + In-Process-C#-Plugins.
+Ein Vanilla-Client kann noch **nicht joinen**, weil Login/JWT/Verschlüsselung
+fehlen; LAN-Erkennung und RakNet-Handshake funktionieren bereits.
+
+Flächenmäßig sind rund **5 %** der PMMP-Codebasis portiert
+(6.500 Zeilen Rust + 3.100 Zeilen C# gegenüber 168.434 Zeilen PHP). Das ist
+kein linearer Maßstab: die Basis-Infrastruktur ist deutlich weiter als die
+Prozentzahl, Gameplay/Netzwerk-Login noch nicht.
+
+| Subsystem | Fortschritt | Stand |
+|---|---:|---|
+| Build, Workspace, Start/Stop, Logging | 90 % | `cargo build`, `./build.sh`, `logs/server.log` |
+| Tick-Loop (20 TPS), Scheduler (Rust + C#) | 85 % | verifiziert über 130 Ticks, wiederholende Tasks |
+| Konfiguration (`server.properties`, `pocketmine.yml`) | 75 % | typisierte Keys + unbekannte Keys bleiben erhalten |
+| Mathematik (Vector3, Blocks, AABB, RNG) | 70 % | Unit-Tests |
+| Block-/Item-Registry (`bedrock-data`) | 65 % | 900+ Blöcke / 1.900+ Items, echte Härtewerte |
+| Welt (Chunks, Subchunks, Block-API) | 30 % | Flat-Generator, Paletten, get/set, kein LevelDB |
+| Spieler / Inventar / Gamemodes | 35 % | 36+4+1 Slots, Stacking, Rechte-Attachments |
+| Commands | 30 % | Map, Aliase, Permissions, 15 Built-ins |
+| Events | 20 % | 16 Kern-Events, Prioritäten, Cancel, Patch-Back |
+| C#-Plugin-System | 65 % | Laden, Lifecycle, `/reload`, Events, Commands, Tasks, Config |
+| Netzwerk (RakNet/Bedrock) | 20 % | Ping/Pong, Offline-Handshake, Frames, `NetworkSettings` |
+| Entities / KI | 5 % | Basismodell, keine Physik/KI |
+| Crafting / Container / Formulare | 0 % | geplant (M3/M4) |
+| Weltformate (LevelDB/Anvil), NBT | 0 % | geplant (M2) |
+| Resource-Packs, Query, RCON | 0 % | geplant (M5) |
+
+### Was jetzt nachweislich läuft
+
+* 20-TPS-Server mit Console, Logdatei und sauberem Shutdown.
+* C#-Plugin `ExamplePlugin` wird geladen, aktiviert und deaktiviert.
+* C#-Events erhalten Priorität, können abbrechen **und Werte zurückschreiben**
+  (z. B. Join-Nachricht, Chat-Text, Schaden).
+* C#-Commands mit Aliassen und Permissions (`/csharp`, `/hello`, `/build`).
+* C#-Scheduler läuft im Server-Takt; `Config` schreibt `config.yml`.
+* Welt-API aus C#: Blöcke lesen/schreiben, Spieler teleportieren, Broadcast.
+* RakNet-Ping liefert einen korrekten 1.26.60-Pong (Server erscheint im LAN).
+* RakNet-Handshake (Request 1/2) und Bedrock-`NetworkSettings` antworten.
+
+### Was als Nächstes kommt
+
+1. **M1 Login:** JWT-Chain, `ServerToClientHandshake`, AES, Compression,
+   `StartGame` + Chunk-Streaming → Vanilla-Client kann joinen.
+2. **M2 Welt:** LevelDB lesen/schreiben, Block-States, Licht, Nachbar-Updates.
+3. **M3 Gameplay:** Entities, Physik, Schaden/Tod, Inventar-Transaktionen.
+4. **M4 API-Parität:** alle PMMP-Events, Form-API, Command-Parser, Selektoren.
+5. **M5 Betrieb:** Timings, Crashdumps, Resource-Packs, Query/RCON, CI.
+
+Details, Namespace-Mapping und Abnahmekriterien: [`PORTING.md`](PORTING.md).
+
+---
+
+## Repository layout
 
 ```text
 PocketMine-Rust/
-├── Cargo.toml                  # Rust workspace configuration
-├── .gitignore                  # Git ignore rules for Rust, .NET, and server data
-├── server.properties           # Bedrock server network & gameplay configuration
-├── pocketmine.yml              # Engine tuning and plugin settings
-├── build.sh                    # Linux build script
-├── build.cmd                   # Windows build script
-├── start.sh                    # Linux server launcher
-├── start.cmd                   # Windows CMD server launcher
-├── start.ps1                   # Windows PowerShell launcher
-│
-├── crates/                     # Rust Server Crates
-│   ├── pm_core/                # Logger, Server Constants, Configs (server.properties)
-│   ├── pm_math/                # Vector3, BlockPosition, Facing, AxisAlignedBB
-│   ├── pm_event/               # Event types, Cancellable trait, EventPriority
-│   ├── pm_command/             # CommandMap, Command trait, Default commands (/help, /stop, etc.)
-│   ├── pm_world/               # World, Chunk, SubChunk, Block registry
-│   ├── pm_player/              # Player model, GameMode, Inventory & ItemStack
-│   ├── pm_network/             # Bedrock RakNet UDP listener & packet handler
-│   ├── pm_plugin_host/         # HostFXR CoreCLR runtime loader & FFI bridge
-│   └── pm_server/              # Main executable (pmmp / PocketMine) & tick loop
-│
-├── csharp/                     # C# .NET Ecosystem
-│   ├── PocketMine.Sdk/         # C# API library referenced by plugin authors
-│   ├── PocketMine.Host/        # In-process .NET host assembly invoked by Rust
-│   └── plugins/
-│       └── ExamplePlugin/      # Demonstration C# plugin (Commands, Events)
-│
-└── plugins/                    # Directory for compiled C# plugin .dll files
+├── crates/                     Rust engine
+│   ├── pm_core/                constants, logger, server.properties, pocketmine.yml, text
+│   ├── pm_math/                Vector2/3, BlockPosition, Facing, AABB, Location, RNG
+│   ├── pm_data/                block/item registry (bedrock-data JSON, same data as PMMP)
+│   ├── pm_event/               events, priorities, cancellation, JSON patch
+│   ├── pm_permission/          permissions, defaults, attachments
+│   ├── pm_command/             command map, aliases, senders
+│   ├── pm_scheduler/           delayed / repeating tick tasks
+│   ├── pm_world/               chunks, sub-chunks, blocks, worlds, entities
+│   ├── pm_player/              player, inventory, gamemodes, player manager
+│   ├── pm_network/             RakNet UDP, pong, handshake, frame codec
+│   ├── pm_plugin_host/         hostfxr + C ABI + event/command bridge
+│   └── pm_server/              bootstrap, tick loop, built-in commands, ServerBridge
+├── csharp/
+│   ├── PocketMine.Sdk/         API referenced by plugin authors
+│   ├── PocketMine.Host/        managed host loaded by Rust (do not reference directly)
+│   └── plugins/ExamplePlugin/  reference plugin (events, commands, scheduler, world API)
+├── plugins/                    drop compiled plugins here (also created on start)
+├── tools/                      ping.py, smoke-test.sh
+├── server.properties           Bedrock server configuration
+├── pocketmine.yml              engine configuration
+└── PORTING.md                  port status + roadmap
 ```
 
 ---
 
-## 🚀 Building & Running
+## Build & run
 
-### Prerequisites
-
-1. **Rust Toolchain**: `rustc` and `cargo` (1.75+ or 1.100+)
-2. **.NET SDK**: .NET 8, 9, or 10 (`dotnet` CLI)
-
-### On Linux
+Requirements: Rust 1.75+ (tested with 1.100) and the **.NET 10 SDK**.
 
 ```bash
-# 1. Build the entire ecosystem (SDK, Host, Plugins, and Server):
-./build.sh
-
-# 2. Start the server:
-./start.sh
+./build.sh      # C# SDK + host + example plugin + Rust release binary
+./start.sh      # start the server
 ```
 
-### On Windows
+Windows: `build.cmd`, then `start.cmd` / `start.ps1`.
 
-```cmd
-:: 1. Build the ecosystem:
-build.cmd
+Useful flags:
 
-:: 2. Start the server:
-start.cmd
+```text
+--no-plugins        skip the C# host (pure Rust mode)
+--no-network        skip the UDP listener
+--port <port>       override server-port
+--plugins <dir>     plugin directory (default: pocketmine.yml / "plugins")
+--ticks <n>         stop after n ticks (CI/smoke tests)
+--version / --help
 ```
-*(Or in PowerShell: `.\start.ps1`)*
+
+On start the server also prints the level, binds UDP (19132) and advertises
+itself via RakNet:
+
+```bash
+python3 tools/ping.py 19132
+```
 
 ---
 
-## 💻 Writing a C# Plugin
+## Writing a C# plugin
 
-Creating a plugin in PocketMine-Rust is simple and familiar to anyone who has written plugins for PocketMine-MP or Spigot.
-
-### 1. Create a C# Project
+### 1. Project
 
 ```xml
 <Project Sdk="Microsoft.NET.Sdk">
@@ -105,116 +139,187 @@ Creating a plugin in PocketMine-Rust is simple and familiar to anyone who has wr
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Version>1.0.0.0</Version>
   </PropertyGroup>
-
   <ItemGroup>
-    <ProjectReference Include="..\..\csharp\PocketMine.Sdk\PocketMine.Sdk.csproj" />
+    <ProjectReference Include="..\..\PocketMine.Sdk\PocketMine.Sdk.csproj" />
   </ItemGroup>
 </Project>
 ```
 
-### 2. Implement `PluginBase`
+### 2. Plugin class
 
 ```csharp
 using PocketMine.Plugin;
-using PocketMine.Command;
-using PocketMine.Event;
 
-namespace MyAwesomePlugin;
+namespace MyPlugin;
 
-[Plugin("MyAwesomePlugin", "1.0.0", Author = "YourName", Description = "A C# Bedrock Plugin")]
+[Plugin("MyPlugin", "1.0.0", Author = "You", Api = "1.0.0.0",
+        Description = "Example plugin")]
 public class Main : PluginBase
 {
     public override void OnLoad()
     {
-        Logger.Info("MyAwesomePlugin is loading!");
+        Logger.Info("Loading...");
+        if (!Config.Has("message"))
+        {
+            Config.Set("message", "§aHello, {player}!");
+            SaveConfig();               // plugins/MyPlugin/config.yml
+        }
     }
 
     public override void OnEnable()
     {
-        Logger.Info("MyAwesomePlugin enabled!");
-
-        // Register custom commands
         Server.RegisterCommand(new HelloCommand());
 
-        // Register event listeners
-        Server.RegisterEvents(new MyListener(this), this);
+        // Rust tick scheduler: every 5 seconds
+        Server.Scheduler.RunTaskTimer(this, () =>
+            Logger.Info($"TPS {Server.Tps:F1}, players {Server.PlayerCount}"),
+            delayTicks: 20, periodTicks: 100);
     }
 
-    public override void OnDisable()
-    {
-        Logger.Info("MyAwesomePlugin disabled!");
-    }
+    public override void OnDisable() => Logger.Info("Bye.");
 }
 ```
 
-### 3. Handle Events
+### 3. Commands
 
 ```csharp
-public class MyListener : IListener
-{
-    private readonly Main _plugin;
+using PocketMine.Command;
 
-    public MyListener(Main plugin) => _plugin = plugin;
-
-    [EventHandler(Priority = EventPriority.Normal)]
-    public void OnPlayerJoin(PlayerJoinEvent ev)
-    {
-        ev.Player.SendMessage($"§aWelcome §e{ev.Player.Name}§a to our PocketMine-Rust server!");
-    }
-
-    [EventHandler(Priority = EventPriority.High)]
-    public void OnPlayerChat(PlayerChatEvent ev)
-    {
-        if (ev.Message.StartsWith("!ping"))
-        {
-            ev.Player.SendMessage("§bPong from C#!");
-            ev.IsCancelled = true; // Cancels the chat message
-        }
-    }
-}
-```
-
-### 4. Create Commands
-
-```csharp
 public class HelloCommand : Command
 {
-    public HelloCommand() : base("hello", "Say hello", "/hello") {}
+    public HelloCommand() : base("hello", "Greets you", "/hello", "myplugin.command.hello")
+    {
+        Aliases.Add("hi");
+    }
 
     public override bool Execute(ICommandSender sender, string label, string[] args)
     {
-        sender.SendMessage("§6Hello from C# running inside Rust!");
+        sender.SendMessage("§aHello from C# inside Rust!");
         return true;
     }
 }
 ```
 
-### 5. Deploy
+### 4. Events
 
-Compile the plugin and copy the generated `.dll` into the `plugins/` directory:
+```csharp
+using PocketMine.Event;
 
-```bash
-dotnet build -c Release
-cp bin/Release/net10.0/MyAwesomePlugin.dll ../../plugins/
+public class Listener : IListener
+{
+    [EventHandler(Priority = EventPriority.Normal)]
+    public void OnJoin(PlayerJoinEvent ev)
+    {
+        ev.JoinMessage = $"§e{ev.Player.Name} joined §7(C#)";   // visible in Rust
+        ev.Player.SendMessage($"§aWelcome, {ev.Player.Name}!");
+    }
+
+    [EventHandler(Priority = EventPriority.High)]
+    public void OnChat(PlayerChatEvent ev)
+    {
+        if (ev.Message == "!ping")
+        {
+            ev.Player.SendMessage("§bPong from C#!");
+            ev.IsCancelled = true;
+        }
+    }
+}
 ```
 
-Restart or start the server; your plugin will be loaded automatically!
+Register listeners in `OnEnable()`:
+
+```csharp
+Server.RegisterEvents(new Listener(), this);
+```
+
+### 5. World / player API
+
+```csharp
+Player? player = Server.GetPlayer("Steve");
+World? world = Server.DefaultWorld;
+
+Block block = world.GetBlock(0, 64, 0);
+world.SetBlock(0, 65, 0, "minecraft:stone");
+
+player?.Teleport(0, 80, 0);
+Server.BroadcastMessage($"§e{Server.PlayerCount} players online");
+```
+
+### 6. Packaging
+
+* `plugins/MyPlugin.dll` (single assembly, simplest), or
+* `plugins/MyPlugin/MyPlugin.dll` plus dependencies and an optional
+  `plugin.json`:
+
+```json
+{
+  "name": "MyPlugin",
+  "version": "1.0.0",
+  "main": "MyPlugin.Main",
+  "api": "1.0.0.0",
+  "author": "You",
+  "description": "Example",
+  "depend": []
+}
+```
+
+The loader resolves `PocketMine.Sdk` from the host, other assemblies from the
+plugin folder, and supports dependency ordering via `Depends`/`depend`.
 
 ---
 
-## 📜 Default Commands
+## Built-in commands
 
-- `/help` — List all registered commands (both Rust native and C# plugin commands).
-- `/version` — Show PocketMine-Rust engine and .NET runtime details.
-- `/plugins` — List all loaded C# plugins.
-- `/csharp` — Test command provided by `ExamplePlugin`.
-- `/say <msg>` — Broadcast a message to the console and online players.
-- `/list` — Display connected players.
-- `/stop` — Gracefully stop the server, saving worlds and disabling plugins.
+| Command | Description |
+|---|---|
+| `/help [command]` | command list and details |
+| `/info`, `/status`, `/version`, `/tps` | server, world and performance info |
+| `/plugins` | loaded C# plugins |
+| `/list`, `/say <msg>`, `/kick <player> [reason]`, `/op`, `/deop` | administration |
+| `/world <info\|list\|time\|settime\|getblock\|setblock\|tp>` | world and block access |
+| `/event <join\|quit\|chat\|break\|place\|damage\|death\|respawn>` | dispatch a test event to plugins |
+| `/reload` | disable, reload and re-enable plugins |
+| `/stop` | save worlds and shut down |
+| `/csharp`, `/hello`, `/build` | provided by `ExamplePlugin` |
+
+`/event` exists so the whole Rust ↔ C# event pipeline can be tested without a
+Bedrock client.
 
 ---
 
-## 📄 License
+## C# API overview
 
-Licensed under the [LGPL-3.0 License](LICENSE) (matching PocketMine-MP).
+| Namespace | Contents |
+|---|---|
+| `PocketMine.Plugin` | `PluginBase`, `[Plugin]`, config, resources |
+| `PocketMine.Server` | `IServer`, `IPluginManager`, `ServerInfo`, `NativeBridge` |
+| `PocketMine.Player` | `Player`, `GameMode` |
+| `PocketMine.World` | `World`, `Block` |
+| `PocketMine.Item` / `.Inventory` | `ItemStack`, `PlayerInventory` |
+| `PocketMine.Event` | `Event`, `CancellableEvent`, `IListener`, `[EventHandler]`, 16 events |
+| `PocketMine.Command` | `Command`, `ICommandSender`, `ConsoleCommandSender` |
+| `PocketMine.Scheduler` | `ITaskScheduler`, `TaskHandler` |
+| `PocketMine.Permission` | `Permission`, `PermissionDefault` |
+| `PocketMine.Math` | `Vector3`, `BlockPosition` |
+| `PocketMine.Utils` | `ILogger`, `Config`, `TextFormat` |
+
+---
+
+## Tests
+
+```bash
+cargo test --workspace      # registry, world, inventory, scheduler, pong, frames
+./tools/smoke-test.sh       # builds everything and drives the server end-to-end
+```
+
+The smoke test asserts that the C# plugin loads, receives commands/events,
+mutates chat/join messages, uses the world API, runs scheduled tasks and that
+the UDP listener answers a RakNet ping.
+
+---
+
+## License
+
+LGPL-3.0, matching PocketMine-MP. See [`LICENSE`](LICENSE).

@@ -10,6 +10,7 @@ public enum EventPriority
     Monitor = 5,
 }
 
+/// <summary>Marker interface for classes containing event handlers.</summary>
 public interface IListener
 {
 }
@@ -18,14 +19,17 @@ public interface IListener
 public sealed class EventHandlerAttribute : Attribute
 {
     public EventPriority Priority { get; init; } = EventPriority.Normal;
-    public bool IgnoreCancelled { get; init; } = false;
+    public bool IgnoreCancelled { get; init; }
 }
 
 public abstract class Event
 {
-    public virtual bool IsCancelled { get; set; } = false;
+    public virtual bool IsCancellable => false;
+    public bool IsCancelled { get; set; }
+    public abstract string EventName { get; }
 }
 
 public abstract class CancellableEvent : Event
 {
+    public override bool IsCancellable => true;
 }

@@ -16,9 +16,11 @@ obj/
 *.userosvmat
 _ReSharper*/
 
-# Compiled plugins
+# Compiled plugins and their runtime data
 plugins/*.dll
-plugins/*/*.log
+plugins/*/
+!plugins/README.md
+plugins/*.log
 
 # Runtime generated server files
 server.log

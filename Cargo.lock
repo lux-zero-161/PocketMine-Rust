@@ -3,83 +3,129 @@
 version = 4
 
 [[package]]
+name = "itoa"
+version = "1.0.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bd1574e617a9a6c1f8f8181bd7e841e1f20e4277607ef28945765188d6284d4"
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
 name = "pm_command"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pm_core",
 ]
 
 [[package]]
 name = "pm_core"
-version = "0.1.0"
+version = "1.0.0"
+
+[[package]]
+name = "pm_data"
+version = "1.0.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "pm_event"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pm_math",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "pm_math"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "pm_network"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pm_core",
+]
+
+[[package]]
+name = "pm_permission"
+version = "1.0.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
 name = "pm_player"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pm_command",
  "pm_core",
+ "pm_data",
  "pm_math",
+ "pm_permission",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "pm_plugin_host"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "pm_command",
  "pm_core",
  "pm_event",
+ "pm_permission",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
+name = "pm_scheduler"
+version = "1.0.0"
+
+[[package]]
 name = "pm_server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "pm_command",
  "pm_core",
+ "pm_data",
+ "pm_event",
+ "pm_math",
  "pm_network",
+ "pm_permission",
+ "pm_player",
  "pm_plugin_host",
+ "pm_scheduler",
  "pm_world",
+ "serde_json",
 ]
 
 [[package]]
 name = "pm_world"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
+ "pm_core",
+ "pm_data",
  "pm_math",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -131,6 +177,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "syn"
 version = "3.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -146,3 +205,9 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

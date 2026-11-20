@@ -1,8 +1,9 @@
 [package]
 name = "pm_server"
-version = "0.1.0"
-edition = "2021"
-description = "PocketMine-Rust Server Runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PocketMine-Rust server runtime"
 
 [[bin]]
 name = "PocketMine"
@@ -10,7 +11,14 @@ path = "src/main.rs"
 
 [dependencies]
 pm_core = { path = "../pm_core" }
+pm_math = { path = "../pm_math" }
+pm_data = { path = "../pm_data" }
 pm_command = { path = "../pm_command" }
+pm_event = { path = "../pm_event" }
+pm_permission = { path = "../pm_permission" }
+pm_scheduler = { path = "../pm_scheduler" }
 pm_world = { path = "../pm_world" }
+pm_player = { path = "../pm_player" }
 pm_network = { path = "../pm_network" }
 pm_plugin_host = { path = "../pm_plugin_host" }
+serde_json = { workspace = true }

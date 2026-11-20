@@ -1,8 +1,8 @@
 [package]
 name = "pm_core"
-version = "0.1.0"
-edition = "2021"
-description = "PocketMine-Rust Core: Constants, Logging, Configuration, Timings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PocketMine-Rust Core: constants, logging, configuration, text formatting"
 
 [dependencies]
-serde = { workspace = true }

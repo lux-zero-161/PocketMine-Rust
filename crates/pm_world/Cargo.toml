@@ -1,8 +1,13 @@
 [package]
 name = "pm_world"
-version = "0.1.0"
-edition = "2021"
-description = "PocketMine-Rust World, Chunk and Block Management"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PocketMine-Rust world, chunk and block management"
 
 [dependencies]
 pm_math = { path = "../pm_math" }
+pm_data = { path = "../pm_data" }
+pm_core = { path = "../pm_core" }
+serde = { workspace = true }
+serde_json = { workspace = true }

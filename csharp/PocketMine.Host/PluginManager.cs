@@ -1,242 +1,470 @@
+using System.Reflection;
+using System.Runtime.Loader;
+using System.Text.Json;
 using PocketMine.Command;
 using PocketMine.Event;
-using PocketMine.Math;
-using PocketMine.Player;
 using PocketMine.Plugin;
 using PocketMine.Server;
 using PocketMine.Utils;
-using System.Reflection;
-using System.Runtime.InteropServices;
-using System.Runtime.Loader;
 
 namespace PocketMine.Host;
 
-public class PluginLogger : ILogger
+public sealed class PluginManifest
 {
-    private readonly string _name;
+    public string? Name { get; set; }
+    public string? Version { get; set; }
+    public string? Author { get; set; }
+    public string? Description { get; set; }
+    public string? Api { get; set; }
+    public string? Main { get; set; }
+    public List<string> Depend { get; set; } = new();
 
-    public PluginLogger(string name)
+    public static PluginManifest? Load(string directory)
     {
-        _name = name;
-    }
-
-    public void Info(string message) => Entrypoint.Log(1, $"[{_name}] {message}");
-    public void Warning(string message) => Entrypoint.Log(3, $"[{_name}] {message}");
-    public void Error(string message) => Entrypoint.Log(4, $"[{_name}] {message}");
-    public void Debug(string message) => Entrypoint.Log(0, $"[{_name}] {message}");
-}
-
-public class RegisteredListener
-{
-    public PluginBase Plugin { get; }
-    public IListener Listener { get; }
-    public MethodInfo Method { get; }
-    public Type EventType { get; }
-    public EventPriority Priority { get; }
-    public bool IgnoreCancelled { get; }
-
-    public RegisteredListener(PluginBase plugin, IListener listener, MethodInfo method, Type eventType, EventPriority priority, bool ignoreCancelled)
-    {
-        Plugin = plugin;
-        Listener = listener;
-        Method = method;
-        EventType = eventType;
-        Priority = priority;
-        IgnoreCancelled = ignoreCancelled;
-    }
-}
-
-public class PluginHostServer : IServer
-{
-    public readonly Dictionary<string, Command.Command> Commands = new(StringComparer.OrdinalIgnoreCase);
-    public readonly List<RegisteredListener> Listeners = new();
-
-    public void BroadcastMessage(string message)
-    {
-        Entrypoint.BroadcastMessage(message);
-    }
-
-    public void RegisterCommand(Command.Command command)
-    {
-        Commands[command.Name] = command;
-        Entrypoint.RegisterCommand(command.Name, command.Description, command.UsageMessage, command.Permission);
-    }
-
-    public void RegisterEvents(IListener listener, PluginBase plugin)
-    {
-        var methods = listener.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-        foreach (var method in methods)
+        string path = Path.Combine(directory, "plugin.json");
+        if (!File.Exists(path))
         {
-            var attr = method.GetCustomAttribute<EventHandlerAttribute>();
-            if (attr == null) continue;
+            return null;
+        }
+        try
+        {
+            return JsonSerializer.Deserialize<PluginManifest>(File.ReadAllText(path), new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            Native.Log(3, $"Invalid plugin.json in {directory}: {ex.Message}");
+            return null;
+        }
+    }
+}
 
-            var parameters = method.GetParameters();
-            if (parameters.Length != 1 || !typeof(Event.Event).IsAssignableFrom(parameters[0].ParameterType))
+/// <summary>
+/// Discovers and loads C# plugin assemblies. Supports both
+/// <c>plugins/MyPlugin.dll</c> and <c>plugins/MyPlugin/MyPlugin.dll</c>, with an
+/// optional <c>plugin.json</c> manifest next to the assembly.
+/// </summary>
+public sealed class PluginManager : IPluginManager, IPluginManagerInternal
+{
+    private sealed class Candidate
+    {
+        public required Type Type { get; init; }
+        public required PluginAttribute? Attribute { get; init; }
+        public required PluginManifest? Manifest { get; init; }
+        public required string Directory { get; init; }
+        public required string AssemblyPath { get; init; }
+        public required AssemblyLoadContext Context { get; init; }
+    }
+
+    private readonly PluginHostServer _server;
+    private readonly List<PluginBase> _plugins = new();
+    private readonly List<Candidate> _candidates = new();
+    private readonly List<AssemblyLoadContext> _contexts = new();
+    private readonly Dictionary<Command.Command, PluginBase> _commandOwners = new();
+
+    public PluginManager(PluginHostServer server)
+    {
+        _server = server;
+    }
+
+    public IReadOnlyList<PluginBase> Plugins => _plugins;
+
+    /// <summary>Plugin currently executing a lifecycle hook, event or command.</summary>
+    public static PluginBase? CurrentPlugin { get; internal set; }
+
+    public static void RunAs(PluginBase? plugin, Action action)
+    {
+        PluginBase? previous = CurrentPlugin;
+        CurrentPlugin = plugin;
+        try
+        {
+            action();
+        }
+        finally
+        {
+            CurrentPlugin = previous;
+        }
+    }
+
+    public PluginBase? GetPlugin(string name)
+        => _plugins.FirstOrDefault(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    public bool IsPluginEnabled(string name) => GetPlugin(name)?.IsEnabled ?? false;
+
+    public PluginBase? GetPluginOf(Command.Command command)
+        => _commandOwners.TryGetValue(command, out PluginBase? plugin) ? plugin : null;
+
+    public void TrackCommand(Command.Command command, PluginBase plugin) => _commandOwners[command] = plugin;
+
+    public int LoadPlugins(string directory)
+    {
+        Directory.CreateDirectory(directory);
+        string root = Path.GetFullPath(directory);
+        Native.Log(1, $"Scanning C# plugins in {root}");
+
+        var directories = new List<string> { root };
+        foreach (string sub in Directory.GetDirectories(root))
+        {
+            string name = Path.GetFileName(sub);
+            if (name is "bin" or "obj" or ".git")
             {
                 continue;
             }
-
-            var eventType = parameters[0].ParameterType;
-            Listeners.Add(new RegisteredListener(plugin, listener, method, eventType, attr.Priority, attr.IgnoreCancelled));
+            directories.Add(sub);
         }
 
-        Listeners.Sort((a, b) => a.Priority.CompareTo(b.Priority));
-    }
-
-    public void Shutdown()
-    {
-        Entrypoint.Log(1, "Plugin host shutdown requested");
-    }
-}
-
-public class PluginManager
-{
-    public readonly List<PluginBase> Plugins = new();
-    public readonly PluginHostServer Server = new();
-
-    public void LoadPlugins(string pluginsDirectory)
-    {
-        if (!Directory.Exists(pluginsDirectory))
+        foreach (string dir in directories)
         {
-            Directory.CreateDirectory(pluginsDirectory);
+            var manifest = dir == root ? null : PluginManifest.Load(dir);
+            var context = new AssemblyLoadContext($"PluginContext_{Path.GetFileName(dir)}_{Guid.NewGuid():N}", isCollectible: true);
+            context.Resolving += (_, assemblyName) => ResolveAssembly(context, dir, assemblyName);
+            _contexts.Add(context);
+
+            foreach (string file in Directory.GetFiles(dir, "*.dll"))
+            {
+                string fileName = Path.GetFileName(file);
+                if (fileName.Equals("PocketMine.Sdk.dll", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.Equals("PocketMine.Host.dll", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
+                    fileName.StartsWith("System.", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                Assembly assembly;
+                try
+                {
+                    assembly = context.LoadFromAssemblyPath(Path.GetFullPath(file));
+                }
+                catch (BadImageFormatException)
+                {
+                    continue; // native library sitting next to the plugin
+                }
+                catch (Exception ex)
+                {
+                    Native.Log(4, $"Could not load {fileName}: {ex.Message}");
+                    continue;
+                }
+
+                foreach (Type type in SafeGetTypes(assembly))
+                {
+                    if (type.IsAbstract || !typeof(PluginBase).IsAssignableFrom(type))
+                    {
+                        continue;
+                    }
+                    var attribute = type.GetCustomAttribute<PluginAttribute>();
+                    if (manifest?.Main != null && type.FullName != manifest.Main)
+                    {
+                        continue;
+                    }
+                    _candidates.Add(new Candidate
+                    {
+                        Type = type,
+                        Attribute = attribute,
+                        Manifest = manifest,
+                        Directory = dir,
+                        AssemblyPath = file,
+                        Context = context,
+                    });
+                }
+            }
+        }
+
+        if (_candidates.Count == 0)
+        {
+            Native.Log(1, "No C# plugins found.");
+            return 0;
+        }
+
+        foreach (Candidate candidate in OrderByDependencies(_candidates))
+        {
+            Instantiate(candidate);
+        }
+
+        return _plugins.Count;
+    }
+
+    private static Assembly? ResolveAssembly(AssemblyLoadContext context, string directory, AssemblyName name)
+    {
+        if (name.Name == "PocketMine.Sdk")
+        {
+            return typeof(PluginBase).Assembly;
+        }
+        if (name.Name == "PocketMine.Host")
+        {
+            return typeof(PluginManager).Assembly;
+        }
+        string local = Path.Combine(directory, $"{name.Name}.dll");
+        if (File.Exists(local))
+        {
+            return context.LoadFromAssemblyPath(Path.GetFullPath(local));
+        }
+        string hostDir = Path.GetDirectoryName(typeof(PluginManager).Assembly.Location) ?? AppContext.BaseDirectory;
+        string shared = Path.Combine(hostDir, $"{name.Name}.dll");
+        if (File.Exists(shared))
+        {
+            return context.LoadFromAssemblyPath(Path.GetFullPath(shared));
+        }
+        return null;
+    }
+
+    private static IEnumerable<Type> SafeGetTypes(Assembly assembly)
+    {
+        try
+        {
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            return ex.Types.Where(t => t != null)!;
+        }
+    }
+
+    private static List<Candidate> OrderByDependencies(List<Candidate> candidates)
+    {
+        var byName = new Dictionary<string, Candidate>(StringComparer.OrdinalIgnoreCase);
+        foreach (Candidate candidate in candidates)
+        {
+            string name = PluginName(candidate);
+            if (!byName.ContainsKey(name))
+            {
+                byName[name] = candidate;
+            }
+        }
+
+        var ordered = new List<Candidate>();
+        var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void Visit(Candidate candidate)
+        {
+            string name = PluginName(candidate);
+            if (visited.Contains(name) || !visiting.Add(name))
+            {
+                return;
+            }
+            foreach (string dependency in Dependencies(candidate))
+            {
+                if (byName.TryGetValue(dependency, out Candidate? dep))
+                {
+                    Visit(dep);
+                }
+                else
+                {
+                    Native.Log(3, $"Plugin {name} depends on {dependency}, which is not installed");
+                }
+            }
+            visiting.Remove(name);
+            visited.Add(name);
+            ordered.Add(candidate);
+        }
+
+        foreach (Candidate candidate in candidates)
+        {
+            Visit(candidate);
+        }
+        return ordered;
+    }
+
+    private static string PluginName(Candidate candidate)
+        => candidate.Attribute?.Name ?? candidate.Manifest?.Name ?? candidate.Type.Name;
+
+    private static IEnumerable<string> Dependencies(Candidate candidate)
+    {
+        if (candidate.Attribute?.Depends is { Length: > 0 } depends)
+        {
+            return depends;
+        }
+        return candidate.Manifest?.Depend ?? (IEnumerable<string>)Array.Empty<string>();
+    }
+
+    private void Instantiate(Candidate candidate)
+    {
+        string name = PluginName(candidate);
+        if (_plugins.Any(p => p.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+        {
+            Native.Log(3, $"Duplicate plugin name '{name}' ignored ({candidate.AssemblyPath})");
             return;
         }
 
-        var hostLocation = typeof(PluginManager).Assembly.Location;
-        var hostDir = Path.GetDirectoryName(hostLocation) ?? AppContext.BaseDirectory;
-        Entrypoint.Log(1, $"HostDir: {hostDir}, scanning directory: {Path.GetFullPath(pluginsDirectory)}");
-
-        var dllFiles = Directory.GetFiles(pluginsDirectory, "*.dll");
-        Entrypoint.Log(1, $"Found {dllFiles.Length} dll file(s) in {pluginsDirectory}");
-        foreach (var file in dllFiles)
+        string api = candidate.Attribute?.Api ?? candidate.Manifest?.Api ?? "1.0.0.0";
+        if (!ApiCompatible(api))
         {
-            var fileName = Path.GetFileName(file);
-            Entrypoint.Log(1, $"Found plugin candidate: {fileName}");
-            if (fileName.Equals("PocketMine.Sdk.dll", StringComparison.OrdinalIgnoreCase) ||
-                fileName.Equals("PocketMine.Host.dll", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            try
-            {
-                var loadContext = new AssemblyLoadContext(fileName, isCollectible: true);
-                loadContext.Resolving += (context, asmName) =>
-                {
-                    if (asmName.Name == "PocketMine.Sdk")
-                    {
-                        return typeof(PluginBase).Assembly;
-                    }
-                    // Check Host directory
-                    var inHost = Path.Combine(hostDir, $"{asmName.Name}.dll");
-                    if (File.Exists(inHost))
-                    {
-                        return typeof(PluginManager).Assembly;
-                    }
-                    // Check plugins directory
-                    var inPlugins = Path.Combine(pluginsDirectory, $"{asmName.Name}.dll");
-                    if (File.Exists(inPlugins))
-                    {
-                        return context.LoadFromAssemblyPath(inPlugins);
-                    }
-                    return null;
-                };
-
-                var assembly = loadContext.LoadFromAssemblyPath(Path.GetFullPath(file));
-
-                foreach (var type in assembly.GetTypes())
-                {
-                    if (type.IsAbstract || !typeof(PluginBase).IsAssignableFrom(type))
-                        continue;
-
-                    if (Activator.CreateInstance(type) is PluginBase plugin)
-                    {
-                        var pluginAttr = type.GetCustomAttribute<PluginAttribute>();
-                        plugin.Name = pluginAttr?.Name ?? type.Name;
-                        plugin.Version = pluginAttr?.Version ?? "1.0.0";
-                        plugin.Author = pluginAttr?.Author ?? "Unknown";
-                        plugin.Description = pluginAttr?.Description ?? "";
-                        plugin.Logger = new PluginLogger(plugin.Name);
-                        plugin.Server = Server;
-                        plugin.DataFolder = Path.Combine(pluginsDirectory, plugin.Name);
-
-                        if (!Directory.Exists(plugin.DataFolder))
-                        {
-                            Directory.CreateDirectory(plugin.DataFolder);
-                        }
-
-                        plugin.OnLoad();
-                        Plugins.Add(plugin);
-                        Entrypoint.Log(1, $"Loaded C# plugin {plugin.Name} v{plugin.Version} by {plugin.Author}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Entrypoint.Log(4, $"Failed to load plugin from {fileName}: {ex.Message}");
-            }
+            Native.Log(4, $"Plugin {name} requires API {api}, server provides {pmVersions.ApiVersion}");
+            return;
         }
+
+        try
+        {
+            if (Activator.CreateInstance(candidate.Type) is not PluginBase plugin)
+            {
+                Native.Log(4, $"Could not instantiate plugin type {candidate.Type.FullName}");
+                return;
+            }
+
+            plugin.Name = name;
+            plugin.Version = candidate.Attribute?.Version ?? candidate.Manifest?.Version ?? "1.0.0";
+            plugin.Author = candidate.Attribute?.Author ?? candidate.Manifest?.Author ?? "Unknown";
+            plugin.Description = candidate.Attribute?.Description ?? candidate.Manifest?.Description ?? "";
+            plugin.ApiVersion = api;
+            plugin.Logger = new PluginLogger(name);
+            plugin.Server = _server;
+            plugin.DataFolder = Path.Combine(candidate.Directory, name);
+            Directory.CreateDirectory(plugin.DataFolder);
+
+            RunAs(plugin, plugin.OnLoad);
+            _plugins.Add(plugin);
+            Native.Log(1, $"Loaded C# plugin {plugin.Name} v{plugin.Version} by {plugin.Author} [API {api}]");
+        }
+        catch (Exception ex)
+        {
+            Native.Log(4, $"Error loading plugin {name}: {ex}");
+        }
+    }
+
+    private static bool ApiCompatible(string required)
+    {
+        static int Major(string version) => int.TryParse(version.Split('.')[0], out int major) ? major : -1;
+        return Major(required) == Major(pmVersions.ApiVersion);
     }
 
     public void EnablePlugins()
     {
-        foreach (var plugin in Plugins)
+        foreach (PluginBase plugin in _plugins)
         {
-            if (plugin.IsEnabled) continue;
+            if (plugin.IsEnabled)
+            {
+                continue;
+            }
             try
             {
                 plugin.IsEnabled = true;
-                plugin.OnEnable();
-                Entrypoint.Log(1, $"Enabled C# plugin {plugin.Name} v{plugin.Version}");
+                RunAs(plugin, plugin.OnEnable);
+                Native.Log(1, $"Enabled C# plugin {plugin.Name} v{plugin.Version}");
             }
             catch (Exception ex)
             {
                 plugin.IsEnabled = false;
-                Entrypoint.Log(4, $"Error enabling plugin {plugin.Name}: {ex}");
+                Native.Log(4, $"Error enabling plugin {plugin.Name}: {ex}");
             }
         }
     }
 
     public void DisablePlugins()
     {
-        for (int i = Plugins.Count - 1; i >= 0; i--)
+        for (int i = _plugins.Count - 1; i >= 0; i--)
         {
-            var plugin = Plugins[i];
-            if (!plugin.IsEnabled) continue;
+            PluginBase plugin = _plugins[i];
             try
             {
-                plugin.OnDisable();
-                plugin.IsEnabled = false;
-                Entrypoint.Log(1, $"Disabled C# plugin {plugin.Name}");
+                if (plugin.IsEnabled)
+                {
+                    RunAs(plugin, plugin.OnDisable);
+                }
             }
             catch (Exception ex)
             {
-                Entrypoint.Log(4, $"Error disabling plugin {plugin.Name}: {ex}");
+                Native.Log(4, $"Error disabling plugin {plugin.Name}: {ex}");
+            }
+            plugin.IsEnabled = false;
+            if (_server.Scheduler is HostTaskScheduler scheduler)
+            {
+                scheduler.CancelTasks(plugin);
+            }
+            UnregisterPlugin(plugin);
+        }
+        _plugins.Clear();
+        _candidates.Clear();
+        _commandOwners.Clear();
+        // Collectible load contexts allow /reload without leaking the plugin
+        // assemblies; all listeners/commands referencing them are gone by now.
+        foreach (AssemblyLoadContext context in _contexts)
+        {
+            try
+            {
+                context.Unload();
+            }
+            catch (Exception ex)
+            {
+                Native.Log(3, $"Could not unload plugin context: {ex.Message}");
             }
         }
-        Plugins.Clear();
-        Server.Commands.Clear();
-        Server.Listeners.Clear();
+        _contexts.Clear();
+    }
+
+    public void UnregisterPlugin(PluginBase plugin)
+    {
+        foreach (var command in _commandOwners.Where(kv => ReferenceEquals(kv.Value, plugin)).Select(kv => kv.Key).ToList())
+        {
+            _server.Commands.Remove(command.Name);
+            Native.UnregisterCommand(command.Name);
+            _commandOwners.Remove(command);
+        }
+        _server.Listeners.RemoveAll(listener => ReferenceEquals(listener.Plugin, plugin));
     }
 
     public void DispatchEvent(Event.Event ev)
     {
-        foreach (var listener in Server.Listeners)
+        // Copy because handlers may register or remove listeners.
+        foreach (RegisteredListener listener in _server.Listeners.ToArray())
         {
-            if (!listener.Plugin.IsEnabled) continue;
-            if (!listener.EventType.IsInstanceOfType(ev)) continue;
-
-            if (ev.IsCancelled && listener.IgnoreCancelled)
+            if (!listener.Plugin.IsEnabled || !listener.EventType.IsInstanceOfType(ev))
+            {
                 continue;
-
+            }
+            if (ev.IsCancelled && listener.IgnoreCancelled)
+            {
+                continue;
+            }
             try
             {
-                listener.Method.Invoke(listener.Listener, new object[] { ev });
+                RunAs(listener.Plugin, () => listener.Method.Invoke(listener.Listener, new object[] { ev }));
+            }
+            catch (TargetInvocationException ex)
+            {
+                Native.Log(4, $"Error in event handler {listener.Plugin.Name}::{listener.Method.Name}: {ex.InnerException?.Message ?? ex.Message}");
             }
             catch (Exception ex)
             {
-                Entrypoint.Log(4, $"Error in event handler {listener.Plugin.Name}: {ex.InnerException?.Message ?? ex.Message}");
+                Native.Log(4, $"Error dispatching {ev.EventName} to {listener.Plugin.Name}: {ex.Message}");
             }
         }
     }
+
+    public string ListPluginsJson()
+    {
+        var list = _plugins.Select(plugin => new
+        {
+            name = plugin.Name,
+            version = plugin.Version,
+            author = plugin.Author,
+            description = plugin.Description,
+            api = plugin.ApiVersion,
+            enabled = plugin.IsEnabled,
+            commands = _server.Commands.Values
+                .Where(command => ReferenceEquals(GetPluginOf(command), plugin))
+                .Select(command => command.Name)
+                .ToArray(),
+        });
+        return JsonSerializer.Serialize(list);
+    }
+}
+
+public interface IPluginManagerInternal
+{
+    void TrackCommand(Command.Command command, PluginBase plugin);
+}
+
+public sealed class PluginLogger : ILogger
+{
+    private readonly string _name;
+
+    public PluginLogger(string name) => _name = name;
+
+    public void Info(string message) => Native.Log(1, $"[{_name}] {message}");
+    public void Warning(string message) => Native.Log(3, $"[{_name}] {message}");
+    public void Error(string message) => Native.Log(4, $"[{_name}] {message}");
+    public void Debug(string message) => Native.Log(0, $"[{_name}] {message}");
 }
