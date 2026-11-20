@@ -334,10 +334,11 @@ impl Command for StatusCommand {
         if let Some(network) = self.state.network.lock().unwrap().as_ref() {
             let stats = network.stats();
             sender.send_message(&format!(
-                "§7Network: §f{}§7 sessions, §f{}§7 pings, §f{}§7 handshakes",
+                "§7Network: §f{}§7 sessions, §f{}§7 pings, §f{}§7 handshakes, §f{}§7 encrypted",
                 network.session_count(),
                 stats.pings,
-                stats.handshakes
+                stats.handshakes,
+                stats.encryptions
             ));
         }
         true

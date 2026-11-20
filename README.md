@@ -40,7 +40,9 @@ Verified by `./tools/smoke-test.sh`:
 | RakNet offline handshake, ACKs, split frames | ✅ |
 | Bedrock packet batches + raw-deflate compression | ✅ |
 | Bedrock `NetworkSettings` + offline `Login` parsing | ✅ |
-| Bedrock login (JWT/encryption), chunk streaming, entities | ⏳ roadmap |
+| ECDH P-384 handshake JWT (ES384) + AES-256-CFB8 encryption | ✅ |
+| Encrypted `ClientToServerHandshake` → `LoginSuccess` | ✅ |
+| `StartGame`, chunk streaming, entities | ⏳ roadmap |
 
 ### Progress by subsystem
 
@@ -60,7 +62,7 @@ gameplay and protocol coverage.
 | Commands | 35 % | map, aliases, permissions, 19 built-ins |
 | Events | 20 % | 16 core events, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 30 % | ping, handshake, batches, split frames, compression, login parsing |
+| Network (RakNet/Bedrock) | 40 % | ping, batches, split frames, compression, encrypted login handshake |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |
 | World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
@@ -68,8 +70,8 @@ gameplay and protocol coverage.
 
 ### Next milestones
 
-1. **M1 Login:** JWT chain, `ServerToClientHandshake`, AES, compression,
-   `StartGame` and chunk streaming, so a vanilla client can join.
+1. **M1 Login:** ~~JWT parsing, `ServerToClientHandshake`, AES, compression~~
+   – done. Next: `StartGame`, item/block palettes and chunk streaming.
 2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates.
 3. **M3 Gameplay:** entities, physics, damage/death, inventory transactions.
 4. **M4 API parity:** all PMMP events, form API, command parser, selectors.
@@ -112,7 +114,9 @@ PocketMine-Rust/
 
 ## Build & run
 
-Requirements: Rust 1.75+ (tested with 1.100) and the **.NET 10 SDK**.
+Requirements: Rust 1.75+ (tested with 1.100), the **.NET 10 SDK** and
+**OpenSSL** development headers (used for ECDH/ES384/AES, like PMMP's
+`ext-openssl`).
 
 ```bash
 ./build.sh      # C# SDK + host + example plugin + Rust release binary

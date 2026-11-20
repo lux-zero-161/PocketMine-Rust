@@ -12,6 +12,12 @@
 //! * Offline-mode `Login` inspection (identity from the JWT chain) and a clean
 //!   `PlayStatus` rejection until the encrypted login milestone is complete.
 
+pub mod encryption;
+
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use encryption::{create_handshake_jwt, derive_aes_key, derive_shared_secret, random_salt, EncryptionContext};
+use openssl::pkey::{PKey, Private};
 use pm_core::{Logger, RAKNET_MAGIC};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -483,7 +489,6 @@ pub enum SessionState {
     Connected,
 }
 
-#[derive(Debug)]
 pub struct Session {
     pub address: SocketAddr,
     pub mtu: u16,
@@ -494,6 +499,7 @@ pub struct Session {
     pub last_seen: i64,
     pub compression_threshold: u16,
     pub compression_enabled: bool,
+    pub encryption: Option<EncryptionContext>,
     split_assemblies: HashMap<u16, SplitAssembly>,
 }
 
@@ -509,6 +515,7 @@ impl Session {
             last_seen: now_millis(),
             compression_threshold: 256,
             compression_enabled: false,
+            encryption: None,
             split_assemblies: HashMap::new(),
         }
     }
@@ -528,6 +535,8 @@ pub struct LoginIdentity {
     pub display_name: String,
     pub identity: String,
     pub xuid: String,
+    /// Client ECDH public key (DER/SPKI), required for the handshake.
+    pub client_public_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -540,6 +549,7 @@ pub struct NetworkStats {
     pub frames_in: u64,
     pub batches_in: u64,
     pub logins: u64,
+    pub encryptions: u64,
     pub unknown_packets: u64,
 }
 
@@ -556,6 +566,7 @@ pub struct BedrockNetworkServer {
     stats: Arc<RwLock<NetworkStats>>,
     packet_handler: Arc<RwLock<Option<Box<dyn FnMut(SocketAddr, &[u8]) + Send + Sync>>>>,
     next_guid: AtomicU64,
+    server_key: Arc<PKey<Private>>,
 }
 
 impl BedrockNetworkServer {
@@ -566,6 +577,10 @@ impl BedrockNetworkServer {
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         let guid = (now.as_nanos() as i64).wrapping_mul(31) | 1;
+        let server_key = Arc::new(
+            encryption::generate_server_key()
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("ECDH key generation failed: {err}")))?,
+        );
 
         let pong = PongData {
             motd: motd.to_string(),
@@ -596,6 +611,7 @@ impl BedrockNetworkServer {
             stats: Arc::new(RwLock::new(NetworkStats::default())),
             packet_handler: Arc::new(RwLock::new(None)),
             next_guid: AtomicU64::new(guid as u64),
+            server_key,
         })
     }
 
@@ -804,6 +820,30 @@ impl BedrockNetworkServer {
     }
 
     fn handle_payload(&self, addr: SocketAddr, payload: &[u8], compression_enabled: bool) {
+        let encrypted = {
+            let sessions = self.sessions.read().unwrap();
+            sessions.get(&addr).map(|s| s.encryption.is_some()).unwrap_or(false)
+        };
+        let decrypted;
+        let payload = if encrypted {
+            let mut sessions = self.sessions.write().unwrap();
+            let Some(session) = sessions.get_mut(&addr) else { return };
+            let Some(context) = session.encryption.as_mut() else { return };
+            match context.decrypt(payload) {
+                Ok(data) => {
+                    decrypted = data;
+                    decrypted.as_slice()
+                }
+                Err(err) => {
+                    self.logger.debug(&format!("Decryption failed for {}: {}", addr, err));
+                    self.disconnect(addr);
+                    return;
+                }
+            }
+        } else {
+            payload
+        };
+
         let batch = if compression_enabled {
             match decompress_batch(payload) {
                 Ok(batch) => batch,
@@ -839,18 +879,37 @@ impl BedrockNetworkServer {
             LOGIN => {
                 self.stats.write().unwrap().logins += 1;
                 match parse_login(packet) {
-                    Some(identity) => self.logger.info(&format!(
-                        "Login attempt from {}: \"{}\" ({}) protocol {}",
-                        addr, identity.display_name, identity.identity, identity.protocol
-                    )),
-                    None => self.logger.debug(&format!("Could not parse Login packet from {}", addr)),
+                    Some(identity) => {
+                        self.logger.info(&format!(
+                            "Login attempt from {}: \"{}\" ({}) protocol {}",
+                            addr, identity.display_name, identity.identity, identity.protocol
+                        ));
+                        if identity.protocol != pm_core::CURRENT_PROTOCOL as u32 {
+                            self.logger.warning(&format!(
+                                "Client protocol {} is not supported (server: {})",
+                                identity.protocol,
+                                pm_core::CURRENT_PROTOCOL
+                            ));
+                            self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_CLIENT_OLD);
+                            return;
+                        }
+                        if !self.begin_login_encryption(addr, &identity) {
+                            self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
+                        }
+                    }
+                    None => {
+                        self.logger.debug(&format!("Could not parse Login packet from {}", addr));
+                        self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
+                    }
                 }
-                // Encryption + StartGame are the next milestone. Reject cleanly
-                // instead of leaving the client hanging.
-                self.send_play_status(addr, PLAY_STATUS_LOGIN_FAILED_SERVER_OLD);
             }
             CLIENT_TO_SERVER_HANDSHAKE => {
-                self.logger.debug(&format!("ClientToServerHandshake from {}", addr));
+                self.stats.write().unwrap().encryptions += 1;
+                self.logger.info(&format!("Encryption handshake completed for {}", addr));
+                self.send_play_status(addr, PLAY_STATUS_LOGIN_SUCCESS);
+                // StartGame/chunk streaming is the next milestone. Disconnect
+                // with a readable reason instead of leaving the client hanging.
+                self.send_disconnect(addr, "PocketMine-Rust: encryption OK, world streaming is the next milestone");
             }
             _ => {
                 if let Some(handler) = self.packet_handler.write().unwrap().as_mut() {
@@ -883,6 +942,65 @@ impl BedrockNetworkServer {
         self.send_packets(addr, vec![payload], None);
     }
 
+    fn send_disconnect(&self, addr: SocketAddr, message: &str) {
+        let mut payload = Vec::new();
+        payload.push(DISCONNECT);
+        write_varint(&mut payload, 0); // reason: unknown
+        write_varint(&mut payload, 0); // type: message present
+        write_varint(&mut payload, message.len() as u32);
+        payload.extend_from_slice(message.as_bytes());
+        write_varint(&mut payload, 0); // filtered message
+        self.send_packets(addr, vec![payload], None);
+    }
+
+    /// Performs the `ServerToClientHandshake` exchange. The handshake packet is
+    /// sent compressed but still unencrypted; encryption starts right after.
+    fn begin_login_encryption(&self, addr: SocketAddr, identity: &LoginIdentity) -> bool {
+        let Some(client_der) = identity.client_public_key.as_deref() else {
+            self.logger.warning(&format!(
+                "Login from {} has no client public key (Xbox-authenticated chains are not supported yet)",
+                addr
+            ));
+            return false;
+        };
+        let shared_secret = match derive_shared_secret(&self.server_key, client_der) {
+            Ok(secret) => secret,
+            Err(err) => {
+                self.logger.warning(&format!("ECDH with {} failed: {}", addr, err));
+                return false;
+            }
+        };
+        let salt = random_salt();
+        let key = derive_aes_key(&shared_secret, &salt);
+        let jwt = match create_handshake_jwt(&self.server_key, &salt) {
+            Ok(jwt) => jwt,
+            Err(err) => {
+                self.logger.error(&format!("Could not create handshake JWT: {}", err));
+                return false;
+            }
+        };
+
+        let mut packet = Vec::with_capacity(jwt.len() + 6);
+        packet.push(SERVER_TO_CLIENT_HANDSHAKE);
+        write_varint(&mut packet, jwt.len() as u32);
+        packet.extend_from_slice(jwt.as_bytes());
+        self.send_packets(addr, vec![packet], None);
+
+        let context = match EncryptionContext::new(key) {
+            Ok(context) => context,
+            Err(err) => {
+                self.logger.error(&format!("Could not enable encryption: {}", err));
+                return false;
+            }
+        };
+        let mut sessions = self.sessions.write().unwrap();
+        let Some(session) = sessions.get_mut(&addr) else { return false };
+        session.encryption = Some(context);
+        drop(sessions);
+        self.logger.info(&format!("ServerToClientHandshake sent to {}; encryption enabled", addr));
+        true
+    }
+
     /// Sends game packets as a Bedrock batch, split across RakNet frames when
     /// the payload exceeds the negotiated MTU.
     pub fn send_packets(&self, addr: SocketAddr, packets: Vec<Vec<u8>>, compress_override: Option<bool>) {
@@ -893,11 +1011,14 @@ impl BedrockNetworkServer {
 
             let batch = encode_batch(&packets);
             let compress = compress_override.unwrap_or(session.compression_enabled);
-            let payload = if compress {
+            let mut payload = if compress {
                 compress_batch(&batch, session.compression_threshold as usize)
             } else {
                 batch
             };
+            if let Some(context) = session.encryption.as_mut() {
+                payload = context.encrypt(&payload);
+            }
 
             let mtu = session.mtu as usize;
             let frames = split_payload(&payload, mtu, session.reliable_index, session.order_index);
@@ -974,17 +1095,23 @@ fn base64url_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn jwt_payload(token: &str) -> Option<Value> {
-    let mut parts = token.split('.');
-    let _header = parts.next()?;
-    let payload = parts.next()?;
-    let data = base64url_decode(payload)?;
+fn jwt_part(token: &str, index: usize) -> Option<Value> {
+    let part = token.split('.').nth(index)?;
+    let data = base64url_decode(part)?;
     serde_json::from_slice(&data).ok()
 }
 
-/// Parses a Login packet and extracts the player identity without verifying
-/// signatures. Signature/Xbox validation belongs to the encrypted login
-/// milestone; this is enough for offline-mode identity and logging.
+fn jwt_header(token: &str) -> Option<Value> {
+    jwt_part(token, 0)
+}
+
+fn jwt_payload(token: &str) -> Option<Value> {
+    jwt_part(token, 1)
+}
+
+/// Parses a Login packet and extracts the player identity plus the client
+/// ECDH public key. Signatures are not verified yet (offline mode); the key is
+/// what the encrypted handshake needs.
 pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
     if packet.len() < 7 || packet[0] != LOGIN {
         return None;
@@ -1000,42 +1127,133 @@ pub fn parse_login(packet: &[u8]) -> Option<LoginIdentity> {
         return None;
     }
 
-    let chain_len = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
-    let chain_start = 4usize;
-    let chain_end = chain_start.checked_add(chain_len)?;
-    if chain_end > request.len() {
+    let auth_len = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
+    let auth_end = 4usize.checked_add(auth_len)?;
+    if auth_end > request.len() {
         return None;
     }
-    let chain_json: Value = serde_json::from_slice(&request[chain_start..chain_end]).ok()?;
-    let chain = chain_json.get("chain")?.as_array()?;
+    let auth_info: Value = serde_json::from_slice(&request[4..auth_end]).ok()?;
 
     let mut display_name = String::new();
     let mut identity = String::new();
     let mut xuid = String::new();
-    for token in chain {
-        let Some(payload) = jwt_payload(token.as_str()?) else { continue };
-        if let Some(extra) = payload.get("extraData") {
-            if display_name.is_empty() {
-                display_name = extra.get("displayName").and_then(Value::as_str).unwrap_or("").to_string();
-            }
-            if xuid.is_empty() {
-                xuid = extra.get("XUID").and_then(Value::as_str).unwrap_or("").to_string();
+    let mut client_public_key = None;
+
+    // Protocol >= 1.21.93: {"AuthenticationType":..,"Token":"<jwt>","Certificate":..}
+    if let Some(token) = auth_info.get("Token").and_then(Value::as_str) {
+        if let Some(claims) = jwt_payload(token) {
+            display_name = claims.get("xname").and_then(Value::as_str).unwrap_or("").to_string();
+            identity = claims.get("leguuid").and_then(Value::as_str).unwrap_or("").to_string();
+            xuid = claims.get("xuid").and_then(Value::as_str).unwrap_or("").to_string();
+            if let Some(cpk) = claims.get("cpk").and_then(Value::as_str) {
+                client_public_key = STANDARD.decode(cpk).ok();
             }
         }
-        if identity.is_empty() {
-            identity = payload.get("identity").and_then(Value::as_str).unwrap_or("").to_string();
+    }
+
+    // Legacy chain format: {"chain":["<jwt>", ...]}
+    if let Some(chain) = auth_info.get("chain").and_then(Value::as_array) {
+        for token in chain {
+            let Some(token) = token.as_str() else { continue };
+            if let Some(claims) = jwt_payload(token) {
+                if let Some(extra) = claims.get("extraData") {
+                    if display_name.is_empty() {
+                        display_name = extra.get("displayName").and_then(Value::as_str).unwrap_or("").to_string();
+                    }
+                    if xuid.is_empty() {
+                        xuid = extra.get("XUID").and_then(Value::as_str).unwrap_or("").to_string();
+                    }
+                }
+                if identity.is_empty() {
+                    identity = claims.get("identity").and_then(Value::as_str).unwrap_or("").to_string();
+                }
+            }
+            if client_public_key.is_none() {
+                if let Some(header) = jwt_header(token) {
+                    if let Some(x5u) = header.get("x5u").and_then(Value::as_str) {
+                        client_public_key = STANDARD.decode(x5u).ok();
+                    }
+                }
+            }
+        }
+    }
+
+    // Client data JWT follows the auth info blob.
+    let client_data_offset = auth_end;
+    if client_data_offset + 4 <= request.len() {
+        let len = u32::from_le_bytes([
+            request[client_data_offset],
+            request[client_data_offset + 1],
+            request[client_data_offset + 2],
+            request[client_data_offset + 3],
+        ]) as usize;
+        let start = client_data_offset + 4;
+        if start + len <= request.len() {
+            if let Ok(text) = std::str::from_utf8(&request[start..start + len]) {
+                if let Some(claims) = jwt_payload(text) {
+                    if display_name.is_empty() {
+                        display_name = claims
+                            .get("ThirdPartyName")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                    }
+                }
+            }
         }
     }
 
     if display_name.is_empty() && identity.is_empty() {
         return None;
     }
-    Some(LoginIdentity { protocol, display_name, identity, xuid })
+    Some(LoginIdentity { protocol, display_name, identity, xuid, client_public_key })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encryption::{self, EncryptionContext};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+
+    fn make_jwt(claims: Value) -> String {
+        let header = base64url_encode(b"{\"alg\":\"ES384\"}");
+        let body = base64url_encode(claims.to_string().as_bytes());
+        format!("{header}.{body}.")
+    }
+
+    fn build_auth_login(client_der: &[u8]) -> Vec<u8> {
+        let auth_token = make_jwt(serde_json::json!({
+            "xname": "Steve",
+            "leguuid": "00000000-0000-0000-0000-000000000001",
+            "cpk": STANDARD.encode(client_der),
+        }));
+        let auth_info = serde_json::json!({
+            "AuthenticationType": 2,
+            "Token": auth_token,
+            "Certificate": "",
+        })
+        .to_string();
+        let client_data = make_jwt(serde_json::json!({
+            "ThirdPartyName": "Steve",
+            "GameVersion": "1.26.60",
+        }));
+
+        let mut request = Vec::new();
+        request.extend_from_slice(&(auth_info.len() as u32).to_le_bytes());
+        request.extend_from_slice(auth_info.as_bytes());
+        request.extend_from_slice(&(client_data.len() as u32).to_le_bytes());
+        request.extend_from_slice(client_data.as_bytes());
+
+        let mut packet = vec![LOGIN];
+        packet.extend_from_slice(&(pm_core::CURRENT_PROTOCOL as u32).to_be_bytes());
+        write_varint(&mut packet, request.len() as u32);
+        packet.extend_from_slice(&request);
+        packet
+    }
 
     #[test]
     fn pong_string_is_parsable() {
@@ -1249,6 +1467,81 @@ mod tests {
             i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
             PLAY_STATUS_LOGIN_FAILED_SERVER_OLD
         );
+        assert_eq!(server.stats().logins, 1);
+    }
+
+    #[test]
+    fn parses_modern_auth_info_with_client_key() {
+        let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
+        let client = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let client_der = client.public_key_to_der().unwrap();
+
+        let packet = build_auth_login(&client_der);
+        let identity = parse_login(&packet).expect("modern login must parse");
+        assert_eq!(identity.display_name, "Steve");
+        assert_eq!(identity.identity, "00000000-0000-0000-0000-000000000001");
+        assert_eq!(identity.protocol, pm_core::CURRENT_PROTOCOL as u32);
+        assert_eq!(identity.client_public_key.as_deref(), Some(client_der.as_slice()));
+    }
+
+    #[test]
+    fn encrypted_handshake_login_success_roundtrip() {
+        let logger = Arc::new(Logger::new("test"));
+        let server = BedrockNetworkServer::bind("127.0.0.1:0", "Test", 10, logger).unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(800))).unwrap();
+        raknet_handshake(&client, &server);
+
+        // NetworkSettings (uncompressed), then Login (compressed, not yet encrypted).
+        send_frames(&client, &server, &encode_batch(&[vec![REQUEST_NETWORK_SETTINGS]]), 1);
+        let settings = decode_batch(&recv_game_payload(&client)).unwrap();
+        assert_eq!(settings[0][0], NETWORK_SETTINGS);
+
+        let group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
+        let client_key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let client_der = client_key.public_key_to_der().unwrap();
+        let login = build_auth_login(&client_der);
+        send_frames(&client, &server, &compress_batch(&encode_batch(&[login]), 256), 2);
+
+        // ServerToClientHandshake (compressed, unencrypted).
+        let handshake = decode_batch(&decompress_batch(&recv_game_payload(&client)).unwrap()).unwrap();
+        assert_eq!(handshake[0][0], SERVER_TO_CLIENT_HANDSHAKE);
+        let mut offset = 1usize;
+        let jwt_len = read_varint(&handshake[0], &mut offset).unwrap() as usize;
+        let jwt = std::str::from_utf8(&handshake[0][offset..offset + jwt_len]).unwrap();
+        let (server_der, salt) = encryption::parse_handshake_jwt(jwt).expect("handshake JWT");
+        assert!(encryption::verify_handshake_jwt(jwt, &server_der));
+
+        // Client derives the same AES key and answers with an encrypted
+        // ClientToServerHandshake.
+        let server_pub = encryption::public_key_from_der(&server_der).unwrap();
+        let shared = {
+            let mut deriver = openssl::derive::Deriver::new(&client_key).unwrap();
+            deriver.set_peer(&server_pub).unwrap();
+            deriver.derive_to_vec().unwrap()
+        };
+        let key = derive_aes_key(&shared, &salt);
+        let mut client_crypto = EncryptionContext::new(key).unwrap();
+
+        let hello = compress_batch(&encode_batch(&[vec![CLIENT_TO_SERVER_HANDSHAKE]]), 256);
+        let encrypted = client_crypto.encrypt(&hello);
+        send_frames(&client, &server, &encrypted, 3);
+        assert_eq!(server.stats().encryptions, 1);
+
+        // PlayStatus(LoginSuccess) and Disconnect arrive as two encrypted batches.
+        let mut packets = Vec::new();
+        for _ in 0..2 {
+            let encrypted = recv_game_payload(&client);
+            let decrypted = client_crypto.decrypt(&encrypted).expect("server packet decrypt");
+            let batch = decompress_batch(&decrypted).expect("server packet decompress");
+            packets.extend(decode_batch(&batch).unwrap());
+        }
+        assert_eq!(packets[0][0], PLAY_STATUS);
+        assert_eq!(
+            i32::from_be_bytes([packets[0][1], packets[0][2], packets[0][3], packets[0][4]]),
+            PLAY_STATUS_LOGIN_SUCCESS
+        );
+        assert_eq!(packets[1][0], DISCONNECT);
         assert_eq!(server.stats().logins, 1);
     }
 

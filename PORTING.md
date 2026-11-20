@@ -32,8 +32,11 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | RakNet: ACKs, Split-Frames, Reassembly | ✅ | Tests in `pm_network` |
 | Bedrock-Batches + Raw-Deflate-Kompression | ✅ | Threshold 256, Typ-Präfix 1.20.60+ |
 | Bedrock `RequestNetworkSettings` → `NetworkSettings` | ✅ | Ende-zu-Ende-Netzwerktest |
-| Offline-`Login` parsen (Identität aus JWT-Chain) | ✅ | Name/UUID/XUID, ohne Signaturprüfung |
-| Bedrock Login / JWT-Signatur / Verschlüsselung | ⏳ | Client erhält sauberen `PlayStatus` |
+| Offline-`Login` parsen (Identität aus JWT-Chain) | ✅ | Name/UUID/XUID + Client-Public-Key |
+| ECDH P-384 + ES384 Handshake-JWT | ✅ | `ServerToClientHandshake`, Signatur verifiziert |
+| AES-256-CFB8 + PMMP-Checksummen | ✅ | Roundtrip- und Tamper-Tests |
+| Verschlüsselter `ClientToServerHandshake` → `LoginSuccess` | ✅ | Ende-zu-Ende-Test inkl. Entschlüsselung |
+| `StartGame`, Block-/Item-Paletten, Chunk-Streaming | ⏳ | Client wird nach Login sauber getrennt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 
 ---
@@ -126,10 +129,11 @@ Rust nur liest.
 ## Nächste Meilensteine (Reihenfolge)
 
 ### M1 – Login & Netzwerk (kritisch für echte Clients)
-1. `Login`-Paket: JWT-Chain prüfen (Offline-Modus ohne Xbox), `ServerToClientHandshake`.
-2. Verschlüsselung (ECDH + AES-256-CFB8), Compression (zlib/snappy).
-3. `ResourcePacksInfo`, `StartGame`, `BiomeDefinitionList`, `AvailableCommands`.
-4. Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
+1. ✅ `Login`-Paket parsen, Offline-Identität, Client-Public-Key.
+2. ✅ `ServerToClientHandshake` (ECDH P-384, ES384), AES-256-CFB8, Checksummen.
+3. ✅ Compression (raw Deflate), Batches, Split-Frames.
+4. ⏳ `ResourcePacksInfo`, `StartGame`, `BiomeDefinitionList`, `AvailableCommands`.
+5. ⏳ Chunk-Streaming (`LevelChunk` mit Paletten-Encoding).
    **Abnahme:** Vanilla-Client 1.26.60 joint, sieht flache Welt, kann laufen.
 
 ### M2 – Welt & Blöcke
