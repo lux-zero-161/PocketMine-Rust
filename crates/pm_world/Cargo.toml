@@ -1,0 +1,8 @@
+[package]
+name = "pm_world"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust World, Chunk and Block Management"
+
+[dependencies]
+pm_math = { path = "../pm_math" }

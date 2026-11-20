@@ -1,0 +1,36 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+pocketmine
+PocketMine
+PocketMine.exe
+pmmp
+pmmp.exe
+
+# .NET / C# build artifacts
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.userosvmat
+_ReSharper*/
+
+# Compiled plugins
+plugins/*.dll
+plugins/*/*.log
+
+# Runtime generated server files
+server.log
+crashdumps/
+worlds/world/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS specific files
+.DS_Store
+Thumbs.db

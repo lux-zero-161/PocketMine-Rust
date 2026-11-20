@@ -1,0 +1,8 @@
+[package]
+name = "pm_math"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust Math and Geometry module"
+
+[dependencies]
+serde = { workspace = true }

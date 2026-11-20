@@ -1,0 +1,9 @@
+[package]
+name = "pm_event"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust Event System"
+
+[dependencies]
+pm_math = { path = "../pm_math" }
+serde = { workspace = true }

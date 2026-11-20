@@ -1,0 +1,10 @@
+[package]
+name = "pm_player"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust Player and Session Management"
+
+[dependencies]
+pm_core = { path = "../pm_core" }
+pm_math = { path = "../pm_math" }
+pm_command = { path = "../pm_command" }

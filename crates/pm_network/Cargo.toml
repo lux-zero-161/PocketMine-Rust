@@ -1,0 +1,8 @@
+[package]
+name = "pm_network"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust Bedrock RakNet UDP Network Layer"
+
+[dependencies]
+pm_core = { path = "../pm_core" }

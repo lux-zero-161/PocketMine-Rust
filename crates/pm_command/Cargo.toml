@@ -1,0 +1,8 @@
+[package]
+name = "pm_command"
+version = "0.1.0"
+edition = "2021"
+description = "PocketMine-Rust Command System"
+
+[dependencies]
+pm_core = { path = "../pm_core" }

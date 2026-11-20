@@ -1,0 +1,48 @@
+# PocketMine-Rust Main Engine Configuration
+# Matches PocketMine-MP 5.x architecture
+
+settings:
+  language: "eng"
+  force-language: false
+  shutdown-message: "Server closed"
+  query-plugins: true
+  deprecated-verbose: true
+  enable-profiling: false
+  profile-report-trigger: 20
+
+memory:
+  global-limit: 0
+  main-limit: 0
+  check-rate: 20
+  continuous-trigger: true
+
+network:
+  batch-threshold: 256
+  compression-level: 7
+  max-chunks-per-tick: 4
+  upnp-forwarding: false
+
+debug:
+  level: 1
+  commands: true
+
+level-settings:
+  default-format: "mcregion"
+  auto-tick-rate: 1
+  auto-tick-rate-limit: 20
+  base-tick-rate: 1
+
+chunk-ticking:
+  per-tick: 40
+  tick-radius: 3
+  light-updates: true
+
+chunk-generation:
+  queue-size: 8
+  population-queue-size: 8
+
+csharp-plugins:
+  enabled: true
+  plugins-folder: "plugins"
+  runtime: "net10.0"
+  allow-native-interop: true

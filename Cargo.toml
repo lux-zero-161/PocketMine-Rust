@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pm_core",
+    "crates/pm_math",
+    "crates/pm_event",
+    "crates/pm_command",
+    "crates/pm_world",
+    "crates/pm_player",
+    "crates/pm_network",
+    "crates/pm_plugin_host",
+    "crates/pm_server",
+]
+
+[workspace.dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
