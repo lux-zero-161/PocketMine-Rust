@@ -356,6 +356,9 @@ impl ServerState {
             for place in network.take_block_places() {
                 self.handle_block_place(place);
             }
+            for movement in network.take_movements() {
+                self.handle_movement(movement);
+            }
 
             for (address, message) in network.take_chats() {
                 let Some(name) = self.session_players.read().unwrap().get(&address).cloned() else {
@@ -461,6 +464,68 @@ impl ServerState {
             .unwrap()
             .insert(player_name.to_ascii_lowercase(), palette.clone());
         palette
+    }
+
+    fn handle_movement(&self, movement: pm_network::PendingMovement) {
+        let Some(name) = self
+            .session_players
+            .read()
+            .unwrap()
+            .get(&movement.address)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(player) = self.players.get(&name) else {
+            return;
+        };
+
+        let from = player.position();
+        let to = pm_math::Vector3::new(movement.x, movement.y, movement.z);
+        let mut event = pm_event::PlayerMoveEvent::new(
+            player.name.clone(),
+            from.x,
+            from.y,
+            from.z,
+            to.x,
+            to.y,
+            to.z,
+        );
+        if self.dispatch(&mut event) {
+            if let Some(network) = self.network.lock().unwrap().clone() {
+                network.send_packets(
+                    movement.address,
+                    vec![crate::protocol::move_player_packet(
+                        &player,
+                        self.tick_now(),
+                    )],
+                    None,
+                );
+            }
+            return;
+        }
+
+        player.set_position(pm_math::Vector3::new(event.to_x, event.to_y, event.to_z));
+        *player.yaw.write().unwrap() = movement.yaw as f64;
+        *player.pitch.write().unwrap() = movement.pitch as f64;
+        self.broadcast_move(&player, movement.address);
+    }
+
+    fn broadcast_move(&self, player: &Arc<Player>, except: SocketAddr) {
+        let network = self.network.lock().unwrap().clone();
+        let Some(network) = network else { return };
+        let sessions = self.player_sessions.read().unwrap().clone();
+        let packet = crate::protocol::move_player_packet(player, self.tick_now());
+        for other in self.players.online() {
+            if other.name == player.name {
+                continue;
+            }
+            if let Some(address) = sessions.get(&other.name.to_ascii_lowercase()) {
+                if *address != except {
+                    network.send_packets(*address, vec![packet.clone()], None);
+                }
+            }
+        }
     }
 
     fn handle_block_action(&self, action: pm_network::PendingBlockAction) {
@@ -945,7 +1010,7 @@ mod tests {
 #[cfg(test)]
 mod block_tests {
     use super::*;
-    use pm_network::{PendingBlockAction, PendingBlockPlace};
+    use pm_network::{PendingBlockAction, PendingBlockPlace, PendingMovement};
     use pm_player::{ItemStack, Player};
     use pm_world::blocks;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -996,5 +1061,19 @@ mod block_tests {
             item_count: 1,
         });
         assert_eq!(world.get_block_at(0, 3, 0).name(), "minecraft:stone");
+
+        state.handle_movement(PendingMovement {
+            address,
+            x: 10.5,
+            y: 5.0,
+            z: -2.5,
+            yaw: 90.0,
+            pitch: 15.0,
+            head_yaw: 90.0,
+        });
+        let player = state.players.get("Steve").unwrap();
+        assert_eq!(player.position(), pm_math::Vector3::new(10.5, 5.0, -2.5));
+        assert_eq!(*player.yaw.read().unwrap(), 90.0);
+        assert_eq!(*player.pitch.read().unwrap(), 15.0);
     }
 }

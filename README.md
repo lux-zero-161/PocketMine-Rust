@@ -52,6 +52,7 @@ Verified by `./tools/smoke-test.sh`:
 | Spawn sequence: `MovePlayer`, `SetSpawnPosition`, `PLAYER_SPAWN` | ✅ |
 | Client chat (`Text`) and commands (`CommandRequest`) | ✅ |
 | Block break/place (`PlayerAction`, `InventoryTransaction`) + `UpdateBlock` | ✅ |
+| Movement (`PlayerAuthInput`), `PlayerMoveEvent`, position broadcast | ✅ |
 | Server/plugin messages as `Text` packets | ✅ |
 | Real vanilla-client verification, entities | ⏳ next |
 | Network NBT writer/reader (`pm_nbt`) | ✅ |
@@ -74,7 +75,7 @@ gameplay and protocol coverage.
 | Commands | 40 % | map, aliases, permissions, player command execution |
 | Events | 30 % | core events incl. block break/place, cancel + patch-back |
 | C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
-| Network (RakNet/Bedrock) | 80 % | login, spawn, chunks, chat/commands, block updates |
+| Network (RakNet/Bedrock) | 85 % | login, spawn, chunks, chat, block updates, movement |
 | World (chunks, sections, block API) | 55 % | chunk encoder, break/place, still no LevelDB |
 | Entities / AI | 5 % | model only, no physics or AI |
 | Crafting / containers / forms | 0 % | planned (M3/M4) |

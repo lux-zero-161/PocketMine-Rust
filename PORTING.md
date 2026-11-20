@@ -50,6 +50,8 @@ Die Vorlage ist `../PocketMine-MP` mit **1.797 PHP-Dateien / 168.434 Zeilen**.
 | Server-/Plugin-Nachrichten als `Text`-Pakete | ✅ | `flush_player_messages` sendet echt |
 | Block-Abbau (`PlayerAction`) + `UpdateBlock`-Broadcast | ✅ | Creative/Survival-Abbau, Event |
 | Block-Platzierung (`InventoryTransaction` UseItemOn) | ✅ | Item aus dem Paket, Event, Broadcast |
+| Bewegung (`PlayerAuthInput`) + `PlayerMoveEvent` | ✅ | Position/Rotation, Broadcast an andere Spieler |
+| Block-Actions innerhalb `PlayerAuthInput` | ⏳ | für 1.26.40+ noch nicht geparst |
 | Echter Vanilla-Client-Test | ⏳ | unmittelbarer nächster Schritt |
 | Weltformate (LevelDB/Anvil), NBT, Entities-KI | ⏳ | nächste Meilensteine |
 

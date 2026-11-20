@@ -44,6 +44,7 @@ pub mod protocol {
     pub const UPDATE_BLOCK: u8 = 0x15;
     pub const PLAYER_ACTION: u8 = 0x24;
     pub const INVENTORY_TRANSACTION: u8 = 0x1e;
+    pub const PLAYER_AUTH_INPUT: u8 = 0x90;
     pub const SET_TIME: u8 = 0x0a;
     pub const START_GAME: u8 = 0x0b;
     pub const ADD_PLAYER: u8 = 0x0c;
@@ -604,6 +605,18 @@ pub struct LoginIdentity {
     pub client_public_key: Option<Vec<u8>>,
 }
 
+/// Movement state from `PlayerAuthInputPacket`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingMovement {
+    pub address: SocketAddr,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub head_yaw: f32,
+}
+
 /// Block placement request from `InventoryTransactionPacket` (use item on block).
 #[derive(Debug, Clone, Copy)]
 pub struct PendingBlockPlace {
@@ -677,6 +690,7 @@ pub struct BedrockNetworkServer {
     pending_commands: std::sync::Mutex<Vec<(SocketAddr, String)>>,
     pending_block_actions: std::sync::Mutex<Vec<PendingBlockAction>>,
     pending_block_places: std::sync::Mutex<Vec<PendingBlockPlace>>,
+    pending_movements: std::sync::Mutex<Vec<PendingMovement>>,
 }
 
 impl BedrockNetworkServer {
@@ -739,6 +753,7 @@ impl BedrockNetworkServer {
             pending_commands: std::sync::Mutex::new(Vec::new()),
             pending_block_actions: std::sync::Mutex::new(Vec::new()),
             pending_block_places: std::sync::Mutex::new(Vec::new()),
+            pending_movements: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -807,6 +822,12 @@ impl BedrockNetworkServer {
     /// Block placement requests from clients.
     pub fn take_block_places(&self) -> Vec<PendingBlockPlace> {
         let mut guard = self.pending_block_places.lock().unwrap();
+        std::mem::take(&mut *guard)
+    }
+
+    /// Movement updates from clients.
+    pub fn take_movements(&self) -> Vec<PendingMovement> {
+        let mut guard = self.pending_movements.lock().unwrap();
         std::mem::take(&mut *guard)
     }
 
@@ -1160,6 +1181,11 @@ impl BedrockNetworkServer {
                     self.pending_block_places.lock().unwrap().push(place);
                 }
             }
+            PLAYER_AUTH_INPUT => {
+                if let Some(movement) = parse_auth_input(addr, body) {
+                    self.pending_movements.lock().unwrap().push(movement);
+                }
+            }
             RESOURCE_PACK_CLIENT_RESPONSE => self.handle_resource_pack_response(addr, body),
             REQUEST_CHUNK_RADIUS => self.handle_request_chunk_radius(addr, body),
             DISCONNECT => {
@@ -1460,6 +1486,34 @@ fn read_string(input: &[u8], offset: &mut usize) -> Option<String> {
         .to_string();
     *offset += length;
     Some(text)
+}
+
+/// Parses the leading fields of `PlayerAuthInputPacket`: pitch, yaw, position
+/// and head yaw. The remaining input flags/actions are not needed for movement.
+pub fn parse_auth_input(address: SocketAddr, body: &[u8]) -> Option<PendingMovement> {
+    let mut offset = 0usize;
+    let mut float = || -> Option<f32> {
+        let bytes = body.get(offset..offset + 4)?;
+        offset += 4;
+        Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let pitch = float()?;
+    let yaw = float()?;
+    let x = float()? as f64;
+    let y = float()? as f64;
+    let z = float()? as f64;
+    let _move_x = float()?;
+    let _move_z = float()?;
+    let head_yaw = float()?;
+    Some(PendingMovement {
+        address,
+        x,
+        y,
+        z,
+        yaw,
+        pitch,
+        head_yaw,
+    })
 }
 
 /// Parses the leading fields of `InventoryTransactionPacket` for use-item-on-block.
@@ -2295,6 +2349,23 @@ mod tests {
             (5, 4, 5, 1)
         );
         assert_eq!((places[0].item_id, places[0].item_count), (1, 1));
+
+        let mut input = Vec::new();
+        for value in [10f32, 90f32, 1.5f32, 2.5f32, 3.5f32, 0f32, 0f32, 90f32] {
+            input.extend_from_slice(&value.to_le_bytes());
+        }
+        send_client_packet(
+            &mut client_crypto,
+            vec![packet(PLAYER_AUTH_INPUT as u32, input)],
+            10,
+        );
+        let movements = server.take_movements();
+        assert_eq!(movements.len(), 1);
+        assert_eq!(
+            (movements[0].x, movements[0].y, movements[0].z),
+            (1.5, 2.5, 3.5)
+        );
+        assert_eq!(movements[0].yaw, 90.0);
 
         // Disconnect is reported to the server loop.
         let mut bye_body = Vec::new();
