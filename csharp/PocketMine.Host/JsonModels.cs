@@ -58,6 +58,27 @@ public static class JsonModels
         {
             player.Inventory.SetItem(0, ItemStack.Of(held, 1));
         }
+
+        if (element.ValueKind == JsonValueKind.Object &&
+            element.TryGetProperty("inventory", out JsonElement inventory) &&
+            inventory.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement slot in inventory.EnumerateArray())
+            {
+                int index = Int(slot, "slot");
+                string name = Str(slot, "name", "minecraft:air");
+                if (index < 0 || name == "minecraft:air")
+                {
+                    continue;
+                }
+                player.Inventory.SetItem(index, new ItemStack(
+                    name,
+                    Int(slot, "id"),
+                    (ushort)Int(slot, "meta"),
+                    (byte)Int(slot, "count", 1)
+                ));
+            }
+        }
         return player;
     }
 

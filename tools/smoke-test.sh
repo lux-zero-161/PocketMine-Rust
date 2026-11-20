@@ -27,6 +27,9 @@ printf '%s\n' \
   'info' \
   'plugins' \
   'event join SmokeTester' \
+  'gamemode creative SmokeTester' \
+  'give SmokeTester minecraft:diamond 5' \
+  'inv SmokeTester' \
   'hello' \
   'csharp' \
   'event chat SmokeTester !ping' \
@@ -39,6 +42,8 @@ printf '%s\n' \
 grep -q "Loaded C# plugin ExamplePlugin" "$OUTPUT"
 grep -q "connected\|initialized" "$OUTPUT"
 grep -q "Pong from C#" "$OUTPUT"
+grep -q "Inventory of" "$OUTPUT"
+grep -q "minecraft:diamond" "$OUTPUT"
 grep -q "minecraft:diamond_block" "$OUTPUT"
 grep -q "Server stopped after" "$OUTPUT"
 echo "   scripted session OK ($(wc -l <"$OUTPUT") log lines)"

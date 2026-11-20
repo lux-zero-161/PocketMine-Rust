@@ -14,57 +14,67 @@ Porting progress, namespace mapping and the milestone plan are in
 
 ---
 
-## Fortschritt (Stand: 20.11.2026)
+## Status
 
-**Kurzfassung:** Der komplette Stack läuft – Rust-Core + In-Process-C#-Plugins.
-Ein Vanilla-Client kann noch **nicht joinen**, weil Login/JWT/Verschlüsselung
-fehlen; LAN-Erkennung und RakNet-Handshake funktionieren bereits.
+PocketMine-Rust is a working foundation, not a finished server: the complete
+stack runs (Rust core + in-process C# plugins), but a vanilla client cannot
+join yet because Bedrock login/JWT/encryption are the next milestone.
+LAN discovery and the RakNet handshake already work.
 
-Flächenmäßig sind rund **5 %** der PMMP-Codebasis portiert
-(6.500 Zeilen Rust + 3.100 Zeilen C# gegenüber 168.434 Zeilen PHP). Das ist
-kein linearer Maßstab: die Basis-Infrastruktur ist deutlich weiter als die
-Prozentzahl, Gameplay/Netzwerk-Login noch nicht.
+Verified by `./tools/smoke-test.sh`:
 
-| Subsystem | Fortschritt | Stand |
+| Feature | State |
+|---|---|
+| Rust server with 20 TPS tick loop, console, log file | ✅ |
+| Rust + C# task scheduler | ✅ |
+| Block/item registry from `bedrock-data` (900+ blocks, 1,900+ items) | ✅ |
+| Chunked flat world, palette sub-chunks, block get/set | ✅ |
+| Players, inventory (36+4+1), gamemodes, permissions | ✅ |
+| Player inventory sync from Rust to C# | ✅ |
+| Admin commands: `/gamemode`, `/give`, `/tp`, `/kill` | ✅ |
+| C# plugin loading, enable/disable, `/reload` (collectible contexts) | ✅ |
+| C# events: priority, cancellation, **mutation back into Rust** | ✅ |
+| C# commands, aliases, permissions | ✅ |
+| C# scheduler, config, player/world/block/inventory API | ✅ |
+| RakNet ping/pong (server appears in LAN list) | ✅ |
+| RakNet offline handshake + Bedrock `NetworkSettings` | ✅ |
+| Bedrock login (JWT/encryption), chunk streaming, entities | ⏳ roadmap |
+
+### Progress by subsystem
+
+Roughly **5 %** of the 168,434 PHP lines are ported (6,800 lines Rust +
+3,300 lines C#). Percentages are not linear: infrastructure is ahead of
+gameplay and protocol coverage.
+
+| Subsystem | Ported | Notes |
 |---|---:|---|
-| Build, Workspace, Start/Stop, Logging | 90 % | `cargo build`, `./build.sh`, `logs/server.log` |
-| Tick-Loop (20 TPS), Scheduler (Rust + C#) | 85 % | verifiziert über 130 Ticks, wiederholende Tasks |
-| Konfiguration (`server.properties`, `pocketmine.yml`) | 75 % | typisierte Keys + unbekannte Keys bleiben erhalten |
-| Mathematik (Vector3, Blocks, AABB, RNG) | 70 % | Unit-Tests |
-| Block-/Item-Registry (`bedrock-data`) | 65 % | 900+ Blöcke / 1.900+ Items, echte Härtewerte |
-| Welt (Chunks, Subchunks, Block-API) | 30 % | Flat-Generator, Paletten, get/set, kein LevelDB |
-| Spieler / Inventar / Gamemodes | 35 % | 36+4+1 Slots, Stacking, Rechte-Attachments |
-| Commands | 30 % | Map, Aliase, Permissions, 15 Built-ins |
-| Events | 20 % | 16 Kern-Events, Prioritäten, Cancel, Patch-Back |
-| C#-Plugin-System | 65 % | Laden, Lifecycle, `/reload`, Events, Commands, Tasks, Config |
-| Netzwerk (RakNet/Bedrock) | 20 % | Ping/Pong, Offline-Handshake, Frames, `NetworkSettings` |
-| Entities / KI | 5 % | Basismodell, keine Physik/KI |
-| Crafting / Container / Formulare | 0 % | geplant (M3/M4) |
-| Weltformate (LevelDB/Anvil), NBT | 0 % | geplant (M2) |
-| Resource-Packs, Query, RCON | 0 % | geplant (M5) |
+| Build, workspace, logging, shutdown | 90 % | `build.sh`, `logs/server.log` |
+| Tick loop + scheduler (Rust and C#) | 85 % | verified over 130 ticks |
+| Configuration (`server.properties`, `pocketmine.yml`) | 75 % | typed keys, unknown keys preserved |
+| Maths (Vector3, blocks, AABB, RNG) | 70 % | unit-tested |
+| Block/item registry (`bedrock-data`) | 65 % | real hardness/resistance values |
+| World (chunks, sections, block API) | 30 % | flat generator, no LevelDB yet |
+| Player / inventory / gamemodes | 35 % | stacking, permissions attachments |
+| Commands | 35 % | map, aliases, permissions, 19 built-ins |
+| Events | 20 % | 16 core events, cancel + patch-back |
+| C# plugin system | 65 % | load, lifecycle, reload, events, commands, tasks, config |
+| Network (RakNet/Bedrock) | 20 % | ping, offline handshake, frames, `NetworkSettings` |
+| Entities / AI | 5 % | model only, no physics or AI |
+| Crafting / containers / forms | 0 % | planned (M3/M4) |
+| World formats (LevelDB/Anvil), NBT | 0 % | planned (M2) |
+| Resource packs, Query, RCON | 0 % | planned (M5) |
 
-### Was jetzt nachweislich läuft
+### Next milestones
 
-* 20-TPS-Server mit Console, Logdatei und sauberem Shutdown.
-* C#-Plugin `ExamplePlugin` wird geladen, aktiviert und deaktiviert.
-* C#-Events erhalten Priorität, können abbrechen **und Werte zurückschreiben**
-  (z. B. Join-Nachricht, Chat-Text, Schaden).
-* C#-Commands mit Aliassen und Permissions (`/csharp`, `/hello`, `/build`).
-* C#-Scheduler läuft im Server-Takt; `Config` schreibt `config.yml`.
-* Welt-API aus C#: Blöcke lesen/schreiben, Spieler teleportieren, Broadcast.
-* RakNet-Ping liefert einen korrekten 1.26.60-Pong (Server erscheint im LAN).
-* RakNet-Handshake (Request 1/2) und Bedrock-`NetworkSettings` antworten.
+1. **M1 Login:** JWT chain, `ServerToClientHandshake`, AES, compression,
+   `StartGame` and chunk streaming, so a vanilla client can join.
+2. **M2 World:** LevelDB read/write, block states, lighting, neighbour updates.
+3. **M3 Gameplay:** entities, physics, damage/death, inventory transactions.
+4. **M4 API parity:** all PMMP events, form API, command parser, selectors.
+5. **M5 Operations:** timings, crash dumps, resource packs, Query/RCON, CI.
 
-### Was als Nächstes kommt
-
-1. **M1 Login:** JWT-Chain, `ServerToClientHandshake`, AES, Compression,
-   `StartGame` + Chunk-Streaming → Vanilla-Client kann joinen.
-2. **M2 Welt:** LevelDB lesen/schreiben, Block-States, Licht, Nachbar-Updates.
-3. **M3 Gameplay:** Entities, Physik, Schaden/Tod, Inventar-Transaktionen.
-4. **M4 API-Parität:** alle PMMP-Events, Form-API, Command-Parser, Selektoren.
-5. **M5 Betrieb:** Timings, Crashdumps, Resource-Packs, Query/RCON, CI.
-
-Details, Namespace-Mapping und Abnahmekriterien: [`PORTING.md`](PORTING.md).
+Namespace mapping, acceptance criteria and the porting workflow:
+[`PORTING.md`](PORTING.md).
 
 ---
 
@@ -278,11 +288,13 @@ plugin folder, and supports dependency ordering via `Depends`/`depend`.
 | `/info`, `/status`, `/version`, `/tps` | server, world and performance info |
 | `/plugins` | loaded C# plugins |
 | `/list`, `/say <msg>`, `/kick <player> [reason]`, `/op`, `/deop` | administration |
+| `/gamemode <mode> [player]`, `/give <player> <item> [count]` | player state |
+| `/tp <player> <x> <y> <z>`, `/kill <player>` | movement and damage |
 | `/world <info\|list\|time\|settime\|getblock\|setblock\|tp>` | world and block access |
 | `/event <join\|quit\|chat\|break\|place\|damage\|death\|respawn>` | dispatch a test event to plugins |
 | `/reload` | disable, reload and re-enable plugins |
 | `/stop` | save worlds and shut down |
-| `/csharp`, `/hello`, `/build` | provided by `ExamplePlugin` |
+| `/csharp`, `/hello`, `/build`, `/inv` | provided by `ExamplePlugin` |
 
 `/event` exists so the whole Rust ↔ C# event pipeline can be tested without a
 Bedrock client.

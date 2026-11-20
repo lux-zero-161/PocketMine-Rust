@@ -48,6 +48,7 @@ public class Main : PluginBase
         Server.RegisterCommand(new CSharpInfoCommand());
         Server.RegisterCommand(new HelloCommand(this));
         Server.RegisterCommand(new BuildCommand(this));
+        Server.RegisterCommand(new InventoryCommand());
 
         Server.RegisterEvents(new EventListener(this), this);
 
@@ -199,6 +200,43 @@ public class HelloCommand : Command
     {
         string target = args.Length > 0 ? args[0] : sender.Name;
         sender.SendMessage($"§aHello, §e{target}§a! This line came from C# plugin '{_plugin.Name}'.");
+        return true;
+    }
+}
+
+public class InventoryCommand : Command
+{
+    public InventoryCommand()
+        : base("inv", "Shows a player's inventory", "/inv [player]")
+    {
+    }
+
+    public override bool Execute(ICommandSender sender, string commandLabel, string[] args)
+    {
+        string target = args.Length > 0 ? args[0] : sender.Name;
+        PocketMine.Player.Player? player = sender.Server.GetPlayer(target);
+        if (player == null)
+        {
+            sender.SendMessage($"§cPlayer '{target}' not found.");
+            return false;
+        }
+
+        sender.SendMessage($"§7Inventory of §f{player.Name}§7 (gamemode {player.GameMode}):");
+        bool any = false;
+        for (int slot = 0; slot < player.Inventory.Size; slot++)
+        {
+            var item = player.Inventory.GetItem(slot);
+            if (item.IsEmpty)
+            {
+                continue;
+            }
+            any = true;
+            sender.SendMessage($"  §7slot {slot}: §f{item.Name} §7x§f{item.Count}");
+        }
+        if (!any)
+        {
+            sender.SendMessage("  §7(empty)");
+        }
         return true;
     }
 }

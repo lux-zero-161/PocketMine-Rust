@@ -458,7 +458,27 @@ impl Player {
             "is_op": self.is_op(),
             "online": self.is_online(),
             "held_item": self.inventory().held_item().name.clone(),
+            "inventory": self.inventory_json(),
         })
+    }
+
+    fn inventory_json(&self) -> serde_json::Value {
+        let inventory = self.inventory.read().unwrap();
+        let mut slots = Vec::new();
+        for slot in 0..inventory.size() {
+            let Some(entry) = inventory.get(slot) else { continue };
+            if entry.is_empty() {
+                continue;
+            }
+            slots.push(serde_json::json!({
+                "slot": slot,
+                "name": entry.item.name,
+                "id": entry.item.id,
+                "meta": entry.item.meta,
+                "count": entry.item.count,
+            }));
+        }
+        serde_json::Value::Array(slots)
     }
 }
 
@@ -599,5 +619,21 @@ mod tests {
         player.set_online(false);
         assert_eq!(manager.count(), 0);
         assert!(manager.remove("Steve").is_some());
+    }
+}
+
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    #[test]
+    fn inventory_serialises() {
+        let player = Player::new("Json", "uuid", Vector3::ZERO, "world");
+        let leftover = player.inventory_mut().add_item(ItemStack::new("minecraft:diamond", 5));
+        assert_eq!(leftover, 0);
+        let value = player.to_json();
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        assert_eq!(value["inventory"][0]["count"], 5);
+        assert_eq!(value["inventory"][0]["name"], "minecraft:diamond");
     }
 }

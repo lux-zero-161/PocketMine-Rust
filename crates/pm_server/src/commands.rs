@@ -1,3 +1,4 @@
+use crate::player_commands::{GamemodeCommand, GiveCommand, KillCommand, TeleportCommand};
 use crate::server::ServerState;
 use pm_command::{Command, CommandSender};
 use pm_core::{text, VersionInfo};
@@ -905,6 +906,10 @@ pub fn register_default_commands(state: &Arc<ServerState>) {
         Arc::new(OpCommand::new(state.clone(), false)),
         Arc::new(ReloadCommand::new(state.clone())),
         Arc::new(InfoCommand::new(state.clone())),
+        Arc::new(GamemodeCommand::new(state.clone())),
+        Arc::new(GiveCommand::new(state.clone())),
+        Arc::new(TeleportCommand::new(state.clone())),
+        Arc::new(KillCommand::new(state.clone())),
     ];
     for command in commands {
         state.commands.register(command);
